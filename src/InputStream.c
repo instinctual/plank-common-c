@@ -211,7 +211,7 @@ static int offerInputPacket(PPACKET_HOLDER holder) {
 }
 
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
-    SOCK_RET err;
+    int err;
 
     if (nativeInputSender != NULL) {
         uint32_t magic = LE32(holder->packet.header.magic);
@@ -312,7 +312,7 @@ static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
         }
         const uint64_t deadline = PltGetMillis() + 2000;
         do {
-            err = (SOCK_RET)nativeInputSender(
+            err = nativeInputSender(
                 nativeInputSenderContext, type, variablePayload, payloadLength);
             if (err != LI_PLANK_INPUT_WOULD_BLOCK) {
                 break;
@@ -361,7 +361,7 @@ static void floatToNetfloat(float in, netfloat out) {
 
 // Input thread proc
 static void inputSendThreadProc(void* context) {
-    SOCK_RET err;
+    int err;
     PPACKET_HOLDER holder;
     uint32_t multiControllerMagicLE;
     uint32_t relMouseMagicLE;

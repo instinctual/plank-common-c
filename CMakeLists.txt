@@ -5,7 +5,6 @@ project(moonlight-common-c LANGUAGES C)
 string(TOUPPER "x${CMAKE_BUILD_TYPE}" BUILD_TYPE)
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-option(USE_MBEDTLS "Use MbedTLS instead of OpenSSL" OFF)
 option(CODE_ANALYSIS "Run code analysis during compilation" OFF)
 
 SET(CMAKE_C_STANDARD 11)
@@ -53,22 +52,6 @@ else()
   endif()
 endif()
 
-if (USE_MBEDTLS)
-  target_compile_definitions(moonlight-common-c PRIVATE USE_MBEDTLS)
-  find_package(MbedTLS QUIET)
-  if (MBEDTLS_FOUND)
-    target_link_libraries(moonlight-common-c PRIVATE ${MBEDCRYPTO_LIBRARY})
-    target_include_directories(moonlight-common-c SYSTEM PRIVATE ${MBEDTLS_INCLUDE_DIRS})
-  else()
-    # For sub project added via CMake
-    target_link_libraries(moonlight-common-c PRIVATE mbedcrypto)
-  endif()
-else()
-  find_package(OpenSSL 1.0.2 REQUIRED)
-  target_link_libraries(moonlight-common-c PRIVATE ${OPENSSL_CRYPTO_LIBRARY})
-  target_include_directories(moonlight-common-c SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
-endif()
-
 if("${BUILD_TYPE}" STREQUAL "XDEBUG")
   target_compile_definitions(moonlight-common-c PRIVATE LC_DEBUG)
 else()
@@ -114,7 +97,6 @@ endif()
 
 target_include_directories(moonlight-common-c SYSTEM PUBLIC src)
 
-target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
 
 option(PLANK_BUILD_TESTS "Build standalone PLANK protocol/input/queue regression tests" OFF)
 if (PLANK_BUILD_TESTS)

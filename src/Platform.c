@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include "Limelight-internal.h"
+#if defined(LC_POSIX)
+#include <signal.h>
+#endif
 #if defined(__vita__)
 #include <pthread.h>
 #include <psp2/kernel/processmgr.h>
@@ -611,25 +614,22 @@ bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src) {
 }
 
 int initializePlatform(void) {
-    int err;
-
     PltTicksInit();
-
-    err = initializePlatformSockets();
-    if (err != 0) {
-        return err;
+#if defined(LC_POSIX) && !defined(LC_CHROME) && !defined(__vita__) && !defined(__WIIU__) && !defined(__3DS__)
+    // Preserve the process signal policy while network ownership lives in QUIC.
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = 0;
+    if (sigaction(SIGPIPE, &sa, NULL) == -1) {
+        perror("sigaction");
+        return -1;
     }
-
-    enterLowLatencyMode();
-
+#endif
     return 0;
 }
 
 void cleanupPlatform(void) {
-    exitLowLatencyMode();
-
-    cleanupPlatformSockets();
-
     LC_ASSERT(activeThreads == 0);
     LC_ASSERT(activeMutexes == 0);
     LC_ASSERT(activeEvents == 0);

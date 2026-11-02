@@ -344,17 +344,16 @@ void LiInitializeAudioCallbacks(PAUDIO_RENDERER_CALLBACKS arCallbacks);
 // Use LiGetStageName() for stable stage names
 #define STAGE_NONE 0
 #define STAGE_PLATFORM_INIT 1
-#define STAGE_NAME_RESOLUTION 2
-#define STAGE_AUDIO_STREAM_INIT 3
-#define STAGE_SESSION_NEGOTIATION 4
-#define STAGE_CONTROL_STREAM_INIT 5
-#define STAGE_VIDEO_STREAM_INIT 6
-#define STAGE_INPUT_STREAM_INIT 7
-#define STAGE_CONTROL_STREAM_START 8
-#define STAGE_VIDEO_STREAM_START 9
-#define STAGE_AUDIO_STREAM_START 10
-#define STAGE_INPUT_STREAM_START 11
-#define STAGE_MAX 12
+#define STAGE_AUDIO_STREAM_INIT 2
+#define STAGE_SESSION_NEGOTIATION 3
+#define STAGE_CONTROL_STREAM_INIT 4
+#define STAGE_VIDEO_STREAM_INIT 5
+#define STAGE_INPUT_STREAM_INIT 6
+#define STAGE_CONTROL_STREAM_START 7
+#define STAGE_VIDEO_STREAM_START 8
+#define STAGE_AUDIO_STREAM_START 9
+#define STAGE_INPUT_STREAM_START 10
+#define STAGE_MAX 11
 
 // This callback is invoked to indicate that a stage of initialization is about to begin
 typedef void(*ConnListenerStageStarting)(int stage);
