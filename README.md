@@ -1,7 +1,7 @@
 # PLANK Host protocol headers
 
 This Host-only branch retains the protocol declarations consumed by the Linux
-Host: `src/Input.h`, `src/Limelight.h` and `src/plank.h`.
+Host: `src/Limelight.h` and `src/plank.h`.
 
 There is no compiled library, transport implementation or recursive dependency.
 The CMake target `plank_host_protocol` is header-only. PLANK's native KyProto

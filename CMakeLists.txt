@@ -5,6 +5,5 @@ project(plank_host_protocol LANGUAGES NONE)
 add_library(plank_host_protocol INTERFACE)
 target_include_directories(plank_host_protocol INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_sources(plank_host_protocol INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Input.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Limelight.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/plank.h")
