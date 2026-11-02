@@ -214,17 +214,12 @@ const unsigned char* LiVideoFrameData(const DECODE_UNIT* unit);
 #define VIDEO_FORMAT_H265_MAIN10     0x0200 // HEVC Main10 Profile
 #define VIDEO_FORMAT_H265_REXT8_444  0x0400 // HEVC RExt 4:4:4 8-bit Profile
 #define VIDEO_FORMAT_H265_REXT10_444 0x0800 // HEVC RExt 4:4:4 10-bit Profile
-#define VIDEO_FORMAT_AV1_MAIN8       0x1000 // AV1 Main 8-bit profile
-#define VIDEO_FORMAT_AV1_MAIN10      0x2000 // AV1 Main 10-bit profile
-#define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
-#define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
 
 // Masks for clients to use to match video codecs without profile-specific details.
 #define VIDEO_FORMAT_MASK_H264   0x001F
 #define VIDEO_FORMAT_MASK_H265   0x0F00
-#define VIDEO_FORMAT_MASK_AV1    0xF000
-#define VIDEO_FORMAT_MASK_10BIT  0xAA18
-#define VIDEO_FORMAT_MASK_YUV444 0xCC0C
+#define VIDEO_FORMAT_MASK_10BIT  0x0A18
+#define VIDEO_FORMAT_MASK_YUV444 0x0C0C
 #define VIDEO_FORMAT_MASK_YUV422 0x0012
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
@@ -259,9 +254,7 @@ const unsigned char* LiVideoFrameData(const DECODE_UNIT* unit);
 // also providing a sample callback is not allowed.
 #define CAPABILITY_PULL_RENDERER 0x20
 
-// If set in the video renderer capabilities field, this flag specifies that the renderer
-// supports reference frame invalidation for AV1 streams. This flag is only valid on video renderers.
-#define CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 0x40
+// Capability bit 0x40 and video bits 0xF000 are retired; do not reuse.
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
@@ -514,13 +507,9 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_H264            0x00000001
 #define SCM_HEVC            0x00000100
 #define SCM_HEVC_MAIN10     0x00000200
-#define SCM_AV1_MAIN8       0x00010000 // Sunshine extension
-#define SCM_AV1_MAIN10      0x00020000 // Sunshine extension
 #define SCM_H264_HIGH8_444  0x00040000 // Sunshine extension
 #define SCM_HEVC_REXT8_444  0x00080000 // Sunshine extension
 #define SCM_HEVC_REXT10_444 0x00100000 // Sunshine extension
-#define SCM_AV1_HIGH8_444   0x00200000 // Sunshine extension
-#define SCM_AV1_HIGH10_444  0x00400000 // Sunshine extension
 #define SCM_IDENTITY_GBR_444 0x00800000 // PLANK identity G,B,R plane mapping
 #define SCM_H264_HIGH10_444 0x01000000 // PLANK H.264 High 4:4:4 10-bit extension
 #define SCM_H264_HIGH8_422  0x02000000 // PLANK H.264 High 4:2:2 8-bit extension
@@ -529,9 +518,8 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 // SCM masks to identify various codec capabilities
 #define SCM_MASK_H264   (SCM_H264 | SCM_H264_HIGH8_422 | SCM_H264_HIGH8_444 | SCM_H264_HIGH10_422 | SCM_H264_HIGH10_444)
 #define SCM_MASK_HEVC   (SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
-#define SCM_MASK_AV1    (SCM_AV1_MAIN8 | SCM_AV1_MAIN10 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
-#define SCM_MASK_10BIT  (SCM_H264_HIGH10_422 | SCM_H264_HIGH10_444 | SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444 | SCM_AV1_MAIN10 | SCM_AV1_HIGH10_444)
-#define SCM_MASK_YUV444 (SCM_H264_HIGH8_444 | SCM_H264_HIGH10_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
+#define SCM_MASK_10BIT  (SCM_H264_HIGH10_422 | SCM_H264_HIGH10_444 | SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444)
+#define SCM_MASK_YUV444 (SCM_H264_HIGH8_444 | SCM_H264_HIGH10_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
 #define SCM_MASK_YUV422 (SCM_H264_HIGH8_422 | SCM_H264_HIGH10_422)
 
 typedef struct _SERVER_INFORMATION {
