@@ -1,6 +1,5 @@
-// Deterministic scheduling fixture for the actual input worker. Linker wrappers
-// pause after queue inspection/removal; they never change queue or packet data.
-// The legacy peek wrapper permits running this fixture against the old worker.
+// Deterministic scheduling fixture for the actual input worker. The ELF linker
+// wrapper pauses after an atomic poll; it never changes queue or packet data.
 #include "Limelight-internal.h"
 #include "plank_transport_input.h"
 #include <stdatomic.h>
@@ -8,24 +7,16 @@
 #include <stdlib.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "check failed at %d\n", __LINE__); exit(2); } } while (0)
-static atomic_bool holdSender, senderBlocked, armPeek, peekBlocked, releasePeek;
+static atomic_bool holdSender, senderBlocked, armPoll, pollBlocked, releasePoll;
 static atomic_uint absoluteCount, penCount, totalCount;
 
 static void pauseAfterInspection(void) {
-    if (atomic_exchange(&armPeek, false)) {
-        atomic_store(&peekBlocked, true);
-        while (!atomic_load(&releasePeek)) PltSleepMs(1);
+    if (atomic_exchange(&armPoll, false)) {
+        atomic_store(&pollBlocked, true);
+        while (!atomic_load(&releasePoll)) PltSleepMs(1);
     }
 }
 
-int __real_LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queue, void **data);
-int __wrap_LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queue, void **data) {
-    int result = __real_LbqPeekQueueElement(queue, data);
-    if (result == LBQ_SUCCESS) pauseAfterInspection();
-    return result;
-}
-
-#ifdef PLANK_TEST_MATCHED_POLL
 int __real_LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queue, void **data,
                                 bool (*matches)(const void *, const void *),
                                 const void *context);
@@ -38,7 +29,6 @@ int __wrap_LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queue, void **data,
     if (result == LBQ_NO_ELEMENT) pauseAfterInspection();
     return result;
 }
-#endif
 
 static int recordInput(void *context, uint8_t type, const uint8_t *data, size_t size) {
     (void)context; (void)data; (void)size;
@@ -72,16 +62,16 @@ int main(void) {
     waitFlag(&senderBlocked);
     penHover(0.1f);
     CHECK(LiSendMousePositionEvent(100, 100, 1920, 1080) == 0);
-    atomic_store(&armPeek, true);
+    atomic_store(&armPoll, true);
     atomic_store(&holdSender, false);
-    waitFlag(&peekBlocked);
+    waitFlag(&pollBlocked);
 
     // After the sender inspects the absolute head==tail, the producer replaces
     // it and recycles its holder as the following pen packet. A borrowed peek
     // pointer becomes invalid here, whereas the conditional poll is finished.
     CHECK(LiSendMousePositionEvent(0, 0, 1920, 1080) == 0);
     penHover(0.8f);
-    atomic_store(&releasePeek, true);
+    atomic_store(&releasePoll, true);
     CHECK(stopInputStream() == 0);
     destroyInputStream();
     cleanupPlatform();

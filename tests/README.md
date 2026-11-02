@@ -46,15 +46,10 @@ both `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS` to
   position must survive. Linux static-library tests use ELF linker wrappers,
   without runtime test hooks or changing any queue data.
 
-The replacement fixture also supports the pre-fix worker as a negative control:
-compile it against PR head `b2b2b290bb5aa8e473cfffacb39bffc271ada7a4`, omitting
-`PLANK_TEST_MATCHED_POLL` and wrapping only `LbqPeekQueueElement`. It reports
-`absolute=0 pen=1` and fails. Against the repaired worker it reports
-`absolute=1 pen=2` and passes. The old worker returns a borrowed pointer from
-peek; the repaired worker atomically checks and removes a matching head, and
-returns no borrowed pointer for a nonmatching barrier. The wrappers pause
-after either operation, allowing the same producer interleaving in both cases.
+The replacement fixture wraps only `LbqPollQueueElementIf` and requires
+`absolute=1 pen=2`. Apple linkers do not support ELF `--wrap`; Mac package builds
+run the portable wire/tool-barrier and concurrent queue-ownership fixtures
+against their actual common-C library. Linux also runs the deterministic
+replacement fixture. No runtime test hooks or historical worker are required.
 
 Standalone tests are not full Linux/macOS Client or physical Wacom acceptance.
-They do not justify changing the Client's selected common-C gitlink or merging
-the contribution's other feature branches without their own review.
