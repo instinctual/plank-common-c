@@ -420,12 +420,7 @@ static void reassembleFrame(int frameNumber) {
         qdu->decodeUnit.rtpTimestamp = frameTimestamp90Khz;
         qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
 
-        // These might be wrong for a few frames during a transition between SDR and HDR,
-        // but the effects shouldn't very noticable since that's an infrequent operation.
-        //
-        // If we start sending this state in the frame header, we can make it 100% accurate.
-        qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
-        qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
+        qdu->decodeUnit.colorspace = (uint8_t)StreamConfig.colorSpace;
 
         // Invoke the key frame callback if needed
         if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {

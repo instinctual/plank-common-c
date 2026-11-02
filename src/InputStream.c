@@ -1,198 +1,99 @@
 #include "Limelight-internal.h"
-
 #include "plank_transport_input.h"
 #include <stdatomic.h>
+#include <stddef.h>
 
 static atomic_bool initialized;
 static atomic_bool inputFailed;
-
 static PlankNativeInputSender nativeInputSender;
 static void* nativeInputSenderContext;
-
 static LINKED_BLOCKING_QUEUE packetQueue;
 static LINKED_BLOCKING_QUEUE packetHolderFreeList;
 static PLT_THREAD inputSendThread;
 
-static float absCurrentPosX;
-static float absCurrentPosY;
-
-// Limited by number of bits in activeGamepadMask
-#define MAX_GAMEPADS 16
-
-// Accelerometer and gyro
-#define MAX_MOTION_EVENTS 2
-
-static uint8_t currentPenButtonState;
-
+#define MAX_QUEUED_INPUT_PACKETS 150
+#define INLINE_INPUT_SIZE PLANK_TRANSPORT_INPUT_PEN_SIZE
+#define LI_WHEEL_DELTA 120
+#define MOTION_BATCHING_INTERVAL_MS 1
 #define CLAMP(val, min, max) (((val) < (min)) ? (min) : (((val) > (max)) ? (max) : (val)))
 
-#define MAX_QUEUED_INPUT_PACKETS 150
-
-#define PAYLOAD_SIZE(x) BE32((x)->packet.header.size)
-#define PACKET_SIZE(x) (PAYLOAD_SIZE(x) + sizeof(uint32_t))
-
-// Matches Win32 WHEEL_DELTA definition
-#define LI_WHEEL_DELTA 120
-
-// If we try to send more than one stylus or mouse motion event
-// per millisecond, we'll wait a little bit to batch with the next one. This
-// keeps the bounded native input queue current without increasing latency.
-#define MOUSE_BATCHING_INTERVAL_MS 1
-#define PEN_BATCHING_INTERVAL_MS 1
-
-// Don't batch up/down/cancel events
-#define TOUCH_EVENT_IS_BATCHABLE(x) ((x) == LI_TOUCH_EVENT_HOVER || (x) == LI_TOUCH_EVENT_MOVE)
-
-// Contains input stream packets
+// Own the final native payload. Small events reuse a bounded holder pool;
+// variable-length text and raw HID own their bytes until the sender accepts them.
 typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
-
-    // The union must be the last member since we abuse the NV_UNICODE_PACKET
-    // text field to store variable length data which gets split before being
-    // sent to the host.
-    union {
-        NV_INPUT_HEADER header;
-        NV_KEYBOARD_PACKET keyboard;
-        NV_REL_MOUSE_MOVE_PACKET mouseMoveRel;
-        NV_ABS_MOUSE_MOVE_PACKET mouseMoveAbs;
-        NV_MOUSE_BUTTON_PACKET mouseButton;
-        NV_CONTROLLER_PACKET controller;
-        NV_MULTI_CONTROLLER_PACKET multiController;
-        NV_SCROLL_PACKET scroll;
-        SS_HSCROLL_PACKET hscroll;
-        NV_HAPTICS_PACKET haptics;
-        SS_TOUCH_PACKET touch;
-        SS_PEN_PACKET pen;
-        SS_CONTROLLER_ARRIVAL_PACKET controllerArrival;
-        SS_CONTROLLER_TOUCH_PACKET controllerTouch;
-        SS_CONTROLLER_MOTION_PACKET controllerMotion;
-        SS_CONTROLLER_BATTERY_PACKET controllerBattery;
-        SS_RAW_HID_PACKET rawHid;
-        NV_UNICODE_PACKET unicode;
-    } packet;
+    size_t length;
+    uint8_t type;
+    uint8_t payload[];
 } PACKET_HOLDER, *PPACKET_HOLDER;
 
-static PLT_MUTEX batchedInputMutex;
-static PPACKET_HOLDER currentQueuedControllerPacket[MAX_GAMEPADS];
-static struct {
-    float x, y, z;
-    bool dirty; // Update ready to send (queued packet holder in packetQueue)
-} currentGamepadSensorState[MAX_GAMEPADS][MAX_MOTION_EVENTS];
-static struct {
-    int deltaX, deltaY;
-    bool dirty; // Update ready to send (queued packet holder in packetQueue)
-} currentRelativeMouseState;
-
-// Initializes the input stream
 int initializeInputStream(void) {
+    initialized = false;
     inputFailed = false;
-    // Set a high maximum queue size limit to ensure input isn't dropped
-    // while the input send thread is blocked for short periods.
     LbqInitializeLinkedBlockingQueue(&packetQueue, MAX_QUEUED_INPUT_PACKETS);
     LbqInitializeLinkedBlockingQueue(&packetHolderFreeList, MAX_QUEUED_INPUT_PACKETS);
-
-    // Native PLANK input preserves high-resolution scrolling and modifiers.
-
-    currentPenButtonState = 0;
-
-    // Start with the virtual mouse centered
-    absCurrentPosX = absCurrentPosY = 0.5f;
-
-    memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
-    memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
-    PltCreateMutex(&batchedInputMutex);
-
     return 0;
 }
 
-// Destroys and cleans up the input stream
 void destroyInputStream(void) {
-    PLINKED_BLOCKING_QUEUE_ENTRY entry, nextEntry;
-
+    PLINKED_BLOCKING_QUEUE_ENTRY entry, next;
     entry = LbqDestroyLinkedBlockingQueue(&packetQueue);
-
     while (entry != NULL) {
-        nextEntry = entry->flink;
-
-        // The entry is stored in the data buffer
+        next = entry->flink;
         free(entry->data);
-
-        entry = nextEntry;
+        entry = next;
     }
-
     entry = LbqDestroyLinkedBlockingQueue(&packetHolderFreeList);
-
     while (entry != NULL) {
-        nextEntry = entry->flink;
-
-        // The entry is stored in the data buffer
+        next = entry->flink;
         free(entry->data);
-
-        entry = nextEntry;
+        entry = next;
     }
-
-    PltDeleteMutex(&batchedInputMutex);
 }
 
 static void freePacketHolder(PPACKET_HOLDER holder) {
-    LC_ASSERT(holder->packet.header.size != 0);
-
-    // Place the packet holder back into the free list if it's a standard size entry
-    if (PACKET_SIZE(holder) > (int)sizeof(*holder) || LbqOfferQueueItem(&packetHolderFreeList, holder, &holder->entry) != LBQ_SUCCESS) {
+    if (holder->length > INLINE_INPUT_SIZE ||
+            LbqOfferQueueItem(&packetHolderFreeList, holder, &holder->entry) != LBQ_SUCCESS) {
         free(holder);
     }
 }
 
-static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    // If we're using an extended packet holder, we can't satisfy
-    // this allocation from the packet holder free list.
-    if (extraLength > 0) {
-        // We over-allocate here a bit since we're always adding sizeof(*holder),
-        // but this is on purpose. It allows us assume we have a full holder even
-        // if packetLength < sizeof(*holder) and put this allocation into the free
-        // list.
-        return malloc(sizeof(*holder) + extraLength);
+static PPACKET_HOLDER allocatePacketHolder(uint8_t type, size_t length) {
+    PPACKET_HOLDER holder = NULL;
+    if (length == 0 || length > PLANK_TRANSPORT_INPUT_MAX_PAYLOAD_SIZE) return NULL;
+    if (length <= INLINE_INPUT_SIZE) {
+        int result = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
+        if (result == LBQ_INTERRUPTED) return NULL;
+        LC_ASSERT(result == LBQ_SUCCESS || result == LBQ_NO_ELEMENT);
     }
-
-    // Grab an entry from the free list (if available)
-    err = LbqPollQueueElement(&packetHolderFreeList, (void**)&holder);
-    if (err == LBQ_SUCCESS) {
-        return holder;
+    if (!holder) {
+        size_t capacity = length > INLINE_INPUT_SIZE ? length : INLINE_INPUT_SIZE;
+        holder = malloc(offsetof(PACKET_HOLDER, payload) + capacity);
     }
-    else if (err == LBQ_INTERRUPTED) {
-        // We're shutting down. Don't bother allocating.
-        return NULL;
+    if (holder) {
+        holder->type = type;
+        holder->length = length;
     }
-    else {
-        LC_ASSERT(err == LBQ_NO_ELEMENT);
-
-        // Otherwise we'll have to allocate
-        return malloc(sizeof(*holder));
-    }
+    return holder;
 }
 
 static bool isAbsoluteMousePosition(const void* data) {
-    const PACKET_HOLDER* holder = data;
-    return holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC);
+    return ((const PACKET_HOLDER*)data)->type == PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE;
 }
 
 static bool canBatchMousePosition(const void* data, const void* context) {
+    (void)context;
     return isAbsoluteMousePosition(data);
 }
 
 static bool canBatchPenEvent(const void* data, const void* context) {
     const PACKET_HOLDER* next = data;
     const PACKET_HOLDER* current = context;
-    return next->packet.header.magic == LE32(SS_PEN_MAGIC) &&
-           next->packet.pen.penButtons == current->packet.pen.penButtons &&
-           next->packet.pen.eventType == current->packet.pen.eventType;
+    // Event kind, tool and buttons are ordering barriers. In particular, never
+    // replace a pen hover with an eraser hover across a tool transition.
+    return next->type == PLANK_TRANSPORT_INPUT_PEN &&
+           memcmp(next->payload, current->payload, 3) == 0;
 }
 
-// Once an ordered transition cannot be retained, stop the session so the
-// Host releases input. Continuing would leave an unknowably stuck button/tip.
 static void failInput(int error) {
     if (!atomic_exchange(&inputFailed, true)) {
         LbqSignalQueueShutdown(&packetQueue);
@@ -201,1215 +102,209 @@ static void failInput(int error) {
 }
 
 static int offerInputPacket(PPACKET_HOLDER holder) {
-    int result = LbqOfferQueueItemTimed(&packetQueue, holder, &holder->entry,
-                                        100, NULL, NULL);
+    PPACKET_HOLDER replaced = NULL;
+    int result = LbqOfferQueueItemTimed(&packetQueue, holder, &holder->entry, 100,
+        holder->type == PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE ? isAbsoluteMousePosition : NULL,
+        (void**)&replaced);
     if (result == LBQ_BOUND_EXCEEDED) {
         Limelog("Input queue remained full; stopping rather than losing a transition\n");
         failInput(-1);
     }
+    if (result != LBQ_SUCCESS) freePacketHolder(holder);
+    if (replaced) freePacketHolder(replaced);
     return result;
 }
 
-static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
-    int err;
-
-    if (nativeInputSender != NULL) {
-        uint32_t magic = LE32(holder->packet.header.magic);
-        uint8_t payload[PLANK_TRANSPORT_INPUT_PEN_SIZE];
-        const uint8_t* variablePayload = NULL;
-        size_t payloadLength = 0;
-        uint8_t type = 0;
-
-        (void)moreData;
-        switch (magic) {
-        case MOUSE_MOVE_ABS_MAGIC:
-            type = PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE;
-            payloadLength = PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE_SIZE;
-            plank_transport_input_encode_absolute_mouse(
-                payload,
-                (uint16_t)BE16(holder->packet.mouseMoveAbs.x),
-                (uint16_t)BE16(holder->packet.mouseMoveAbs.y),
-                (uint16_t)BE16(holder->packet.mouseMoveAbs.width),
-                (uint16_t)BE16(holder->packet.mouseMoveAbs.height));
-            break;
-        case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
-        case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
-            type = PLANK_TRANSPORT_INPUT_MOUSE_BUTTON;
-            payloadLength = PLANK_TRANSPORT_INPUT_MOUSE_BUTTON_SIZE;
-            payload[0] = holder->packet.mouseButton.button;
-            payload[1] = magic == MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 ?
-                PLANK_TRANSPORT_INPUT_ACTION_PRESS :
-                PLANK_TRANSPORT_INPUT_ACTION_RELEASE;
-            break;
-        case SCROLL_MAGIC_GEN5:
-            type = PLANK_TRANSPORT_INPUT_VERTICAL_SCROLL;
-            payloadLength = PLANK_TRANSPORT_INPUT_SCROLL_SIZE;
-            plank_transport_input_write_u16(
-                payload, (uint16_t)BE16(holder->packet.scroll.scrollAmt1));
-            break;
-        case SS_HSCROLL_MAGIC:
-            type = PLANK_TRANSPORT_INPUT_HORIZONTAL_SCROLL;
-            payloadLength = PLANK_TRANSPORT_INPUT_SCROLL_SIZE;
-            plank_transport_input_write_u16(
-                payload, (uint16_t)BE16(holder->packet.hscroll.scrollAmount));
-            break;
-        case KEY_DOWN_EVENT_MAGIC:
-        case KEY_UP_EVENT_MAGIC:
-            type = PLANK_TRANSPORT_INPUT_KEYBOARD;
-            payloadLength = PLANK_TRANSPORT_INPUT_KEYBOARD_SIZE;
-            plank_transport_input_write_u16(
-                payload, (uint16_t)LE16(holder->packet.keyboard.keyCode));
-            payload[2] = magic == KEY_DOWN_EVENT_MAGIC ?
-                PLANK_TRANSPORT_INPUT_ACTION_PRESS :
-                PLANK_TRANSPORT_INPUT_ACTION_RELEASE;
-            payload[3] = (uint8_t)holder->packet.keyboard.modifiers;
-            payload[4] = (uint8_t)holder->packet.keyboard.flags;
-            break;
-        case UTF8_TEXT_EVENT_MAGIC:
-            type = PLANK_TRANSPORT_INPUT_UTF8_TEXT;
-            variablePayload = (const uint8_t*)holder->packet.unicode.text;
-            payloadLength = PAYLOAD_SIZE(holder) - sizeof(uint32_t);
-            break;
-        case SS_PEN_MAGIC: {
-            float x;
-            float y;
-            float pressure;
-            float contactAreaMajor;
-            float contactAreaMinor;
-            memcpy(&x, holder->packet.pen.x, sizeof(x));
-            memcpy(&y, holder->packet.pen.y, sizeof(y));
-            memcpy(&pressure, holder->packet.pen.pressureOrDistance, sizeof(pressure));
-            memcpy(&contactAreaMajor, holder->packet.pen.contactAreaMajor, sizeof(contactAreaMajor));
-            memcpy(&contactAreaMinor, holder->packet.pen.contactAreaMinor, sizeof(contactAreaMinor));
-            type = PLANK_TRANSPORT_INPUT_PEN;
-            payloadLength = PLANK_TRANSPORT_INPUT_PEN_SIZE;
-            plank_transport_input_encode_pen(
-                payload,
-                holder->packet.pen.eventType,
-                holder->packet.pen.toolType,
-                holder->packet.pen.penButtons,
-                holder->packet.pen.tilt,
-                LE16(holder->packet.pen.rotation),
-                x, y, pressure, contactAreaMajor, contactAreaMinor);
-            break;
-        }
-        case SS_RAW_HID_MAGIC:
-            type = PLANK_TRANSPORT_INPUT_RAW_HID_WACOM;
-            variablePayload = holder->packet.rawHid.data;
-            payloadLength = PACKET_SIZE(holder) - (sizeof(SS_RAW_HID_PACKET) - 1);
-            break;
-        case MOUSE_MOVE_REL_MAGIC_GEN5:
-        case ENABLE_HAPTICS_MAGIC:
-            // PLANK uses absolute mouse input and has no gamepad haptics.
-            return true;
-        default:
-            Limelog("Rejected unsupported input type on native KyProto input: 0x%08x\n", magic);
-            return false;
-        }
-
-        if (variablePayload == NULL) {
-            variablePayload = payload;
-        }
-        const uint64_t deadline = PltGetMillis() + 2000;
-        do {
-            err = nativeInputSender(
-                nativeInputSenderContext, type, variablePayload, payloadLength);
-            if (err != LI_PLANK_INPUT_WOULD_BLOCK) {
-                break;
-            }
-            // Keep this exact packet (and its ordering) until accepted. A
-            // positive WOULD_BLOCK result does not transfer payload ownership.
-            if (!initialized || inputFailed) {
-                return false;
-            }
-            if (PltGetMillis() >= deadline) {
-                break;
-            }
-            PltSleepMs(1);
-        } while (true);
-        if (err != 0) {
-            Limelog("Native KyProto input send failed: %d\n", (int)err);
-            failInput(err);
-            return false;
-        }
-        return true;
+static bool sendInputPacket(uint8_t type, const uint8_t* payload, size_t length) {
+    const uint64_t deadline = PltGetMillis() + 2000;
+    int result;
+    do {
+        result = nativeInputSender(nativeInputSenderContext, type, payload, length);
+        if (result != LI_PLANK_INPUT_WOULD_BLOCK) break;
+        // WOULD_BLOCK does not transfer ownership. Retain this exact event and
+        // its position in the queue until accepted or the session is stopped.
+        if (!initialized || inputFailed) return false;
+        if (PltGetMillis() >= deadline) break;
+        PltSleepMs(1);
+    } while (true);
+    if (result != 0) {
+        Limelog("Native KyProto input send failed: %d\n", result);
+        failInput(result);
+        return false;
     }
-
-    Limelog("PLANK native input sender is not configured\n");
-    ListenerCallbacks.connectionTerminated(-1);
-    return false;
+    return true;
 }
 
-void LiSetPlankNativeInputSender(
-        PlankNativeInputSender sender, void* context) {
+void LiSetPlankNativeInputSender(PlankNativeInputSender sender, void* context) {
     nativeInputSender = sender;
     nativeInputSenderContext = context;
 }
 
-static void floatToNetfloat(float in, netfloat out) {
-    if (IS_LITTLE_ENDIAN()) {
-        memcpy(out, &in, sizeof(in));
-    }
-    else {
-        uint8_t* inb = (uint8_t*)&in;
-        out[0] = inb[3];
-        out[1] = inb[2];
-        out[2] = inb[1];
-        out[3] = inb[0];
-    }
+// Reject malformed/truncated UTF-8 before queuing. A code point may not straddle
+// native text messages, including overlong encodings, surrogates or > U+10FFFF.
+static size_t utf8CodePointLength(const uint8_t* text, size_t remaining) {
+    if (!remaining) return 0;
+    uint8_t first = text[0];
+    size_t length = first < 0x80 ? 1 : first >= 0xc2 && first <= 0xdf ? 2 :
+                    first >= 0xe0 && first <= 0xef ? 3 :
+                    first >= 0xf0 && first <= 0xf4 ? 4 : 0;
+    if (!length || length > remaining) return 0;
+    for (size_t i = 1; i < length; ++i)
+        if ((text[i] & 0xc0) != 0x80) return 0;
+    if ((first == 0xe0 && text[1] < 0xa0) || (first == 0xed && text[1] >= 0xa0) ||
+        (first == 0xf0 && text[1] < 0x90) || (first == 0xf4 && text[1] >= 0x90)) return 0;
+    return length;
 }
 
-// Input thread proc
 static void inputSendThreadProc(void* context) {
-    int err;
-    PPACKET_HOLDER holder;
-    uint32_t multiControllerMagicLE;
-    uint32_t relMouseMagicLE;
-
-    {
-        multiControllerMagicLE = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
-        relMouseMagicLE = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
-    }
-
-    uint64_t lastMousePacketTime = 0;
-    uint64_t lastPenPacketTime = 0;
-
+    (void)context;
+    uint64_t lastMousePacketTime = 0, lastPenPacketTime = 0;
     while (!PltIsThreadInterrupted(&inputSendThread)) {
-        err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
-        if (err != LBQ_SUCCESS) {
-            return;
-        }
-
-        // If it's a multi-controller packet, latch it by clearing currentQueuedControllerPacket.
-        // This will prevent another thread from batching additional data into it while we're
-        // trying to send it.
-        if (holder->packet.header.magic == multiControllerMagicLE) {
-            short controllerNumber = LE16(holder->packet.multiController.controllerNumber);
-
-            PltLockMutex(&batchedInputMutex);
-
-            // It's possible that the enqueuing code already moved on to batching into a new
-            // packet because something (like a button change) forced it to end the batch.
-            // We only need to stop batching into the current packet we're sending here, so
-            // it's fine if the input code continues to update a later packet concurrently.
-            if (holder == currentQueuedControllerPacket[controllerNumber]) {
-                currentQueuedControllerPacket[controllerNumber] = NULL;
-            }
-
-            PltUnlockMutex(&batchedInputMutex);
-        }
-        // If it's a relative mouse move packet, we can do batching
-        else if (holder->packet.header.magic == relMouseMagicLE) {
+        PPACKET_HOLDER holder;
+        if (LbqWaitForQueueElement(&packetQueue, (void**)&holder) != LBQ_SUCCESS) return;
+        bool mouse = holder->type == PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE;
+        bool pen = holder->type == PLANK_TRANSPORT_INPUT_PEN &&
+            (holder->payload[0] == LI_TOUCH_EVENT_HOVER || holder->payload[0] == LI_TOUCH_EVENT_MOVE);
+        if (mouse || pen) {
+            uint64_t* last = mouse ? &lastMousePacketTime : &lastPenPacketTime;
             uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
+            if (now < *last + MOTION_BATCHING_INTERVAL_MS) {
+                PltSleepMs((int)(*last + MOTION_BATCHING_INTERVAL_MS - now));
                 now = PltGetMillis();
             }
-
-            PltLockMutex(&batchedInputMutex);
-
-            // Send as many packets as it takes to get the entire delta through
-            while (currentRelativeMouseState.deltaX != 0 || currentRelativeMouseState.deltaY != 0) {
-                bool more = false;
-
-                if (currentRelativeMouseState.deltaX < INT16_MIN) {
-                    holder->packet.mouseMoveRel.deltaX = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaX -= INT16_MIN;
-                    more = true;
-                }
-                else if (currentRelativeMouseState.deltaX > INT16_MAX) {
-                    holder->packet.mouseMoveRel.deltaX = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaX -= INT16_MAX;
-                    more = true;
-                }
-                else {
-                    holder->packet.mouseMoveRel.deltaX = BE16(currentRelativeMouseState.deltaX);
-                    currentRelativeMouseState.deltaX = 0;
-                }
-
-                if (currentRelativeMouseState.deltaY < INT16_MIN) {
-                    holder->packet.mouseMoveRel.deltaY = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaY -= INT16_MIN;
-                    more = true;
-                }
-                else if (currentRelativeMouseState.deltaY > INT16_MAX) {
-                    holder->packet.mouseMoveRel.deltaY = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaY -= INT16_MAX;
-                    more = true;
-                }
-                else {
-                    holder->packet.mouseMoveRel.deltaY = BE16(currentRelativeMouseState.deltaY);
-                    currentRelativeMouseState.deltaY = 0;
-                }
-
-                // Don't hold the batching lock while we're doing network I/O
-                PltUnlockMutex(&batchedInputMutex);
-
-                // Encrypt and send the split packet
-                if (!sendInputPacket(holder, more)) {
-                    freePacketHolder(holder);
-                    return;
-                }
-
-                PltLockMutex(&batchedInputMutex);
-            }
-
-            // The state change is no longer pending
-            currentRelativeMouseState.dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
-
-            lastMousePacketTime = now;
-
-            // We sent everything we needed in the loop above, so we can just free the
-            // holder of the original packet and wait for another input event.
-            freePacketHolder(holder);
-            continue;
-        }
-        // Coalesce only consecutive absolute moves. Button/key events are
-        // ordering barriers: their preceding position must remain intact.
-        else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
             for (;;) {
                 PPACKET_HOLDER next;
-                // Producers can replace/recycle the head when it is also the
-                // tail. Inspect and acquire ownership in one queue operation.
                 if (LbqPollQueueElementIf(&packetQueue, (void**)&next,
-                                         canBatchMousePosition, NULL) != LBQ_SUCCESS) {
-                    break;
-                }
-                holder->packet.mouseMoveAbs = next->packet.mouseMoveAbs;
-                freePacketHolder(next);
-            }
-
-            lastMousePacketTime = now;
-        }
-        // If it's a pen packet, we should only send the latest move or hover events
-        else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            for (;;) {
-                PPACKET_HOLDER penBatchHolder;
-
-                if (LbqPollQueueElementIf(&packetQueue, (void**)&penBatchHolder,
-                                         canBatchPenEvent, holder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // Replace the current packet with the new one
+                        mouse ? canBatchMousePosition : canBatchPenEvent, holder) != LBQ_SUCCESS) break;
                 freePacketHolder(holder);
-                holder = penBatchHolder;
+                holder = next;
             }
-
-            lastPenPacketTime = now;
+            *last = now;
         }
-        // If it's a motion packet, only send the latest for each sensor type
-        else if (holder->packet.header.magic == LE32(SS_CONTROLLER_MOTION_MAGIC)) {
-            uint8_t controllerNumber = holder->packet.controllerMotion.controllerNumber;
-            uint8_t motionType = holder->packet.controllerMotion.motionType;
-
-            LC_ASSERT(controllerNumber < MAX_GAMEPADS);
-            LC_ASSERT(motionType - 1 < MAX_MOTION_EVENTS);
-
-            PltLockMutex(&batchedInputMutex);
-
-            // LI_MOTION_TYPE_* values are 1-based, so we have to subtract 1 to index into our state array
-            float x = currentGamepadSensorState[controllerNumber][motionType - 1].x;
-            float y = currentGamepadSensorState[controllerNumber][motionType - 1].y;
-            float z = currentGamepadSensorState[controllerNumber][motionType - 1].z;
-
-            // Populate the packet with the latest state
-            floatToNetfloat(x, holder->packet.controllerMotion.x);
-            floatToNetfloat(y, holder->packet.controllerMotion.y);
-            floatToNetfloat(z, holder->packet.controllerMotion.z);
-
-            // The state change is no longer pending
-            currentGamepadSensorState[controllerNumber][motionType - 1].dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
-        }
-        // If it's a UTF-8 text packet, we may need to split it into a several packets to send
-        else if (holder->packet.header.magic == LE32(UTF8_TEXT_EVENT_MAGIC)) {
-            PACKET_HOLDER splitPacket;
-            uint32_t totalLength = PAYLOAD_SIZE(holder) - sizeof(uint32_t);
-            uint32_t i = 0;
-
-            // We send each Unicode code point individually. This way we can always ensure they will
-            // never straddle a packet boundary (which will cause a parsing error on the host).
-            while (i < totalLength && !PltIsThreadInterrupted(&inputSendThread)) {
-                uint32_t codePointLength;
-                uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i];
-                if ((firstByte & 0x80) == 0x00) {
-                    // 1 byte code point
-                    codePointLength = 1;
-                }
-                else if ((firstByte & 0xE0) == 0xC0) {
-                    // 2 byte code point
-                    codePointLength = 2;
-                }
-                else if ((firstByte & 0xF0) == 0xE0) {
-                    // 3 byte code point
-                    codePointLength = 3;
-                }
-                else if ((firstByte & 0xF8) == 0xF0) {
-                    // 4 byte code point
-                    codePointLength = 4;
-                }
-                else {
-                    Limelog("Invalid unicode code point starting byte: %02x\n", firstByte);
+        bool sent = true;
+        if (holder->type == PLANK_TRANSPORT_INPUT_UTF8_TEXT) {
+            for (size_t offset = 0; offset < holder->length;) {
+                size_t length = utf8CodePointLength(holder->payload + offset, holder->length - offset);
+                LC_ASSERT(length != 0); // Validated by the producer before ownership transfer.
+                if (!length || !sendInputPacket(holder->type, holder->payload + offset, length)) {
+                    sent = false;
                     break;
                 }
-
-                // Use the original packet as a template and fixup to send one code point at a time
-                splitPacket = *holder;
-                splitPacket.packet.unicode.header.size = BE32(sizeof(uint32_t) + codePointLength);
-                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], codePointLength);
-
-                // Encrypt and send the split packet
-                if (!sendInputPacket(&splitPacket, i + 1 < totalLength)) {
-                    freePacketHolder(holder);
-                    return;
-                }
-
-                i += codePointLength;
+                offset += length;
             }
-
-            freePacketHolder(holder);
-            continue;
+        } else {
+            sent = sendInputPacket(holder->type, holder->payload, holder->length);
         }
-
-        // Encrypt and send the input packet
-        if (!sendInputPacket(holder, LbqGetItemCount(&packetQueue) > 0)) {
-            freePacketHolder(holder);
-            return;
-        }
-
         freePacketHolder(holder);
+        if (!sent) return;
     }
 }
 
-// Begin the input stream
 int startInputStream(void) {
-    int err;
-
-    if (nativeInputSender == NULL) {
+    if (!nativeInputSender) {
         Limelog("PLANK native input sender is required\n");
         return -1;
     }
-
-    err = PltCreateThread("InputSend", inputSendThreadProc, NULL, &inputSendThread);
-    if (err != 0) {
-        return err;
-    }
-
-    // Allow input packets to be queued now
-    initialized = true;
-
-    return err;
+    int result = PltCreateThread("InputSend", inputSendThreadProc, NULL, &inputSendThread);
+    if (result == 0) initialized = true;
+    return result;
 }
 
-// Stops the input stream
 int stopInputStream(void) {
-    // No more packets should be queued now
     initialized = false;
     LbqSignalQueueShutdown(&packetHolderFreeList);
-
-    // Signal the input send thread to drain all pending
-    // input packets before shutting down.
     LbqSignalQueueDrain(&packetQueue);
     PltJoinThread(&inputSendThread);
-
     return 0;
 }
 
-// Send a mouse move event to the streaming machine
-int LiSendMouseMoveEvent(short deltaX, short deltaY) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    if (deltaX == 0 && deltaY == 0) {
-        return 0;
-    }
-
-    PltLockMutex(&batchedInputMutex);
-
-    // Combine the previous deltas with the new one
-    currentRelativeMouseState.deltaX += deltaX;
-    currentRelativeMouseState.deltaY += deltaY;
-
-    // Queue a packet holder if this is the only pending relative mouse event
-    if (!currentRelativeMouseState.dirty) {
-        // Set the dirty flag to claim ownership of inserting the packet holder
-        // and unlock to allow other threads to enqueue or process input.
-        currentRelativeMouseState.dirty = true;
-        PltUnlockMutex(&batchedInputMutex);
-
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            currentRelativeMouseState.dirty = false;
-            return -1;
-        }
-
-        holder->packet.mouseMoveRel.header.size = BE32(sizeof(NV_REL_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
-        {
-            holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
-        }
-
-        // Remaining fields are set in the input thread based on the latest currentRelativeMouseState values
-
-        err = offerInputPacket(holder);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-
-            // We weren't able to insert the entry, so let the next call try again
-            currentRelativeMouseState.dirty = false;
-        }
-    }
-    else {
-        // There's already a packet holder queued to send this event
-        PltUnlockMutex(&batchedInputMutex);
-        err = 0;
-    }
-
-    return err;
-}
-
-// Send a mouse position update to the streaming machine
 int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight) {
-    PPACKET_HOLDER holder;
-    PPACKET_HOLDER replacedHolder = NULL;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // The wire carries inclusive maxima, not dimensions. Clamp before queuing
-    // so rounding or a captured drag outside the image cannot emit x > maxX
-    // or y > maxY. Reject degenerate geometry without disturbing input order.
-    if (referenceWidth <= 1 || referenceHeight <= 1) {
-        return -1;
-    }
-    x = CLAMP(x, 0, referenceWidth - 1);
-    y = CLAMP(y, 0, referenceHeight - 1);
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
-    holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
-    holder->packet.mouseMoveAbs.unused = 0;
-    holder->packet.mouseMoveAbs.x = BE16(x);
-    holder->packet.mouseMoveAbs.y = BE16(y);
-    // Coordinates span 0 through dimension-1, including the far screen edge.
-    holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
-    holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
-
-    err = LbqOfferQueueItemTimed(&packetQueue, holder, &holder->entry, 100,
-                                isAbsoluteMousePosition, (void**)&replacedHolder);
-    if (err == LBQ_BOUND_EXCEEDED) {
-        failInput(-1);
-    }
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-    if (replacedHolder != NULL) {
-        freePacketHolder(replacedHolder);
-    }
-
-    // This is not thread safe, but it's not a big deal because callers that want to
-    // use LiSendRelativeMotionAsMousePositionEvent() must not mix these function
-    // without synchronization (otherwise the state of the cursor on the host is
-    // undefined anyway).
-    absCurrentPosX = x / (float)(referenceWidth - 1);
-    absCurrentPosY = y / (float)(referenceHeight - 1);
-
-    return err;
+    if (!initialized) return -2;
+    if (referenceWidth <= 1 || referenceHeight <= 1) return -1;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE,
+                                                PLANK_TRANSPORT_INPUT_ABSOLUTE_MOUSE_SIZE);
+    if (!holder) return -1;
+    plank_transport_input_encode_absolute_mouse(holder->payload,
+        CLAMP(x, 0, referenceWidth - 1), CLAMP(y, 0, referenceHeight - 1),
+        referenceWidth - 1, referenceHeight - 1);
+    return offerInputPacket(holder);
 }
 
-// Send a relative motion event using absolute position to the streaming machine
-int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short referenceWidth, short referenceHeight) {
-    // Convert the current position to be relative to the provided reference dimensions
-    short oldPositionX = (short)(absCurrentPosX * referenceWidth);
-    short oldPositionY = (short)(absCurrentPosY * referenceHeight);
-
-    return LiSendMousePositionEvent(CLAMP(oldPositionX + deltaX, 0, referenceWidth),
-                                    CLAMP(oldPositionY + deltaY, 0, referenceHeight),
-                                    referenceWidth, referenceHeight);
-}
-
-// Send a mouse button event to the streaming machine
 int LiSendMouseButtonEvent(char action, int button) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.mouseButton.header.size = BE32(sizeof(NV_MOUSE_BUTTON_PACKET) - sizeof(uint32_t));
-    holder->packet.mouseButton.header.magic = (uint8_t)action;
-    {
-        holder->packet.mouseButton.header.magic++;
-    }
-    holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
-    holder->packet.mouseButton.button = (uint8_t)button;
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    if (!initialized) return -2;
+    if (action != BUTTON_ACTION_PRESS && action != BUTTON_ACTION_RELEASE) return -1;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_MOUSE_BUTTON,
+                                                PLANK_TRANSPORT_INPUT_MOUSE_BUTTON_SIZE);
+    if (!holder) return -1;
+    holder->payload[0] = (uint8_t)button;
+    holder->payload[1] = action == BUTTON_ACTION_PRESS ? PLANK_TRANSPORT_INPUT_ACTION_PRESS : PLANK_TRANSPORT_INPUT_ACTION_RELEASE;
+    return offerInputPacket(holder);
 }
 
-// Send a key press event to the streaming machine
 int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    // For proper behavior, the MODIFIER flag must not be set on the modifier key down event itself
-    // for the extended modifiers on the right side of the keyboard. If the MODIFIER flag is set,
-    // GFE will synthesize an errant key down event for the non-extended key, causing that key to be
-    // stuck down after the extended modifier key is raised. For non-extended keys, we must set the
-    // MODIFIER flag for correct behavior.
-
-
-    holder->packet.keyboard.header.size = BE32(sizeof(NV_KEYBOARD_PACKET) - sizeof(uint32_t));
-    holder->packet.keyboard.header.magic = LE32((uint32_t)keyAction);
-    holder->packet.keyboard.flags = flags;
-    holder->packet.keyboard.keyCode = LE16(keyCode);
-    holder->packet.keyboard.modifiers = modifiers;
-    holder->packet.keyboard.zero2 = 0;
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    if (!initialized) return -2;
+    if (keyAction != KEY_ACTION_DOWN && keyAction != KEY_ACTION_UP) return -1;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_KEYBOARD,
+                                                PLANK_TRANSPORT_INPUT_KEYBOARD_SIZE);
+    if (!holder) return -1;
+    plank_transport_input_write_u16(holder->payload, (uint16_t)keyCode);
+    holder->payload[2] = keyAction == KEY_ACTION_DOWN ? PLANK_TRANSPORT_INPUT_ACTION_PRESS : PLANK_TRANSPORT_INPUT_ACTION_RELEASE;
+    holder->payload[3] = (uint8_t)modifiers;
+    holder->payload[4] = (uint8_t)flags;
+    return offerInputPacket(holder);
 }
 
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
     return LiSendKeyboardEvent2(keyCode, keyAction, modifiers, 0);
 }
 
-int LiSendUtf8TextEvent(const char *text, unsigned int length) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
+int LiSendUtf8TextEvent(const char* text, unsigned int length) {
+    if (!initialized) return -2;
+    if (!text || !length || length > PLANK_TRANSPORT_INPUT_MAX_PAYLOAD_SIZE) return -1;
+    for (size_t offset = 0; offset < length;) {
+        size_t size = utf8CodePointLength((const uint8_t*)text + offset, length - offset);
+        if (!size) return -1;
+        offset += size;
     }
-
-    holder = allocatePacketHolder(length);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    // Magic + string length
-    holder->packet.unicode.header.size = BE32(sizeof(uint32_t) + length);
-    holder->packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
-    memcpy(holder->packet.unicode.text, text, length);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_UTF8_TEXT, length);
+    if (!holder) return -1;
+    memcpy(holder->payload, text, length);
+    return offerInputPacket(holder);
 }
 
 int LiSendRawHidEvent(const unsigned char* data, unsigned int length) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-    if (!(SunshineFeatureFlags & LI_FF_RAW_HID_TABLET) || nativeInputSender == NULL) {
-        return -3;
-    }
-    if (data == NULL || length < sizeof(PLANK_RAW_HID_WIRE_HEADER) ||
-            length > sizeof(PLANK_RAW_HID_WIRE_HEADER) + PLANK_RAW_HID_MAX_PAYLOAD_SIZE) {
-        return -4;
-    }
-
-    holder = allocatePacketHolder((int)length);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.rawHid.header.size = BE32(sizeof(uint32_t) + length);
-    holder->packet.rawHid.header.magic = LE32(SS_RAW_HID_MAGIC);
-    memcpy(holder->packet.rawHid.data, data, length);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    if (!initialized) return -2;
+    if (!(SunshineFeatureFlags & LI_FF_RAW_HID_TABLET) || !nativeInputSender) return -3;
+    if (!data || length < sizeof(PLANK_RAW_HID_WIRE_HEADER) ||
+            length > sizeof(PLANK_RAW_HID_WIRE_HEADER) + PLANK_RAW_HID_MAX_PAYLOAD_SIZE) return -4;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_RAW_HID_WACOM, length);
+    if (!holder) return -1;
+    memcpy(holder->payload, data, length);
+    return offerInputPacket(holder);
 }
 
-static int sendControllerEventInternal(short controllerNumber, short activeGamepadMask,
-    int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
-    short leftStickX, short leftStickY, short rightStickX, short rightStickY)
-{
-    PPACKET_HOLDER holder;
-    int err;
-    bool enqueueHolder = false;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // HACK: We previously used a short for the buttonFlags argument, but we switched to an
-    // int to support additional buttons with Sunshine. Unfortunately, some clients still pass
-    // a short, which gets sign extended to an int. This causes all the new button flags to be
-    // set any time the user presses the Y button on their gamepad (since Y is 0x8000). To deal
-    // with these clients, we will detect this condition by checking if the sign bit is set.
-    // Since we know there's no valid button flag that uses the 31st bit, any case where the
-    // input value is negative is an instance of bug so only the botton 16 bits are valid.
-    if (buttonFlags < 0) {
-        buttonFlags &= 0xFFFF;
-    }
-
-    {
-        // Sunshine supports up to 16 (max number of bits in activeGamepadMask)
-        controllerNumber %= MAX_GAMEPADS;
-    }
-
-    // The batched input mutex protects against the enqueued packet being processed
-    // and freed from underneath us when we're trying to update it.
-    PltLockMutex(&batchedInputMutex);
-
-    // Start with the currently enqueued controller packet (if any)
-    holder = currentQueuedControllerPacket[controllerNumber];
-
-    // Check that this current input is compatible with the current batch
-    if (holder) {
-        // We do not support batching with the legacy controller packet format
-
-        // If this new packet has different button flags, end the batch to ensure the
-        // host receives the exact axis values present at the time of the button press.
-        if (holder->packet.multiController.buttonFlags != LE16((short)buttonFlags) ||
-            holder->packet.multiController.buttonFlags2 != (LE16((short)(buttonFlags >> 16)))) {
-            // Pretend there wasn't a currently queued controller packet
-            holder = NULL;
-        }
-    }
-
-    if (!holder) {
-        // Because we're not using the currently queued packet, it's safe
-        // to unlock here without having to worry about the input thread
-        // touching our packet holder behind our back.
-        PltUnlockMutex(&batchedInputMutex);
-
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            return -1;
-        }
-
-        // Remember that we need to enqueue this holder since it's new
-        enqueueHolder = true;
-
-        // Reacquire the batched input mutex before making it visible to
-        // the input thread by storing this in the input queue or in the
-        // currentQueuedControllerPacket array.
-        PltLockMutex(&batchedInputMutex);
-    }
-
-    {
-        // Generation 4+ servers support passing the controller number
-        holder->packet.multiController.header.size = BE32(sizeof(NV_MULTI_CONTROLLER_PACKET) - sizeof(uint32_t));
-
-        // On Gen 5 servers, the header code is decremented by one
-        {
-            holder->packet.multiController.header.magic = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
-        }
-
-        holder->packet.multiController.headerB = LE16(MC_HEADER_B);
-        holder->packet.multiController.controllerNumber = LE16(controllerNumber);
-        holder->packet.multiController.activeGamepadMask = LE16(activeGamepadMask);
-        holder->packet.multiController.midB = LE16(MC_MID_B);
-        holder->packet.multiController.buttonFlags = LE16((short)buttonFlags);
-        holder->packet.multiController.leftTrigger = leftTrigger;
-        holder->packet.multiController.rightTrigger = rightTrigger;
-        holder->packet.multiController.leftStickX = LE16(leftStickX);
-        holder->packet.multiController.leftStickY = LE16(leftStickY);
-        holder->packet.multiController.rightStickX = LE16(rightStickX);
-        holder->packet.multiController.rightStickY = LE16(rightStickY);
-        holder->packet.multiController.tailA = LE16(MC_TAIL_A);
-        holder->packet.multiController.buttonFlags2 = LE16((short)(buttonFlags >> 16));
-        holder->packet.multiController.tailB = LE16(MC_TAIL_B);
-
-        if (enqueueHolder) {
-            // Make this new packet holder the current enqueued packet
-            currentQueuedControllerPacket[controllerNumber] = holder;
-        }
-    }
-
-    // We can unlock the batched input mutex before enqueuing the new holder because
-    // the input thread only cares if currentQueuedControllerPacket is equal to the
-    // holder it's currently processing. Since it cannot be processing the holder
-    // until we enqueue it, there's no risk here of it processing/freeing the
-    // holder when we're still touching it.
-    //
-    // Unlocking early saves a context switch in the common case where the newly
-    // queued packet wakes up the input thread which then immediately blocks on
-    // the batched input mutex until this thread runs again to release it.
-    PltUnlockMutex(&batchedInputMutex);
-
-    if (enqueueHolder) {
-        // Enqueue the new packet holder
-        err = offerInputPacket(holder);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-        }
-    }
-    else {
-        // The packet holder we updated was already enqueued
-        err = 0;
-    }
-
-    return err;
+static int sendScroll(uint8_t type, short amount) {
+    if (!initialized) return -2;
+    if (!amount) return 0;
+    PPACKET_HOLDER holder = allocatePacketHolder(type, PLANK_TRANSPORT_INPUT_SCROLL_SIZE);
+    if (!holder) return -1;
+    plank_transport_input_write_u16(holder->payload, (uint16_t)amount);
+    return offerInputPacket(holder);
 }
-
-// Send a controller event to the streaming machine
-int LiSendControllerEvent(int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
-    short leftStickX, short leftStickY, short rightStickX, short rightStickY)
-{
-    return sendControllerEventInternal(0, 0x1, buttonFlags, leftTrigger, rightTrigger,
-        leftStickX, leftStickY, rightStickX, rightStickY);
-}
-
-// Send a controller event to the streaming machine
-int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
-    int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
-    short leftStickX, short leftStickY, short rightStickX, short rightStickY)
-{
-    return sendControllerEventInternal(controllerNumber, activeGamepadMask,
-        buttonFlags, leftTrigger, rightTrigger,
-        leftStickX, leftStickY, rightStickX, rightStickY);
-}
-
-// Send a high resolution scroll event to the streaming machine
-int LiSendHighResScrollEvent(short scrollAmount) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    if (scrollAmount == 0) {
-        return 0;
-    }
-
-    // Newer version of GFE that use virtual HID devices have a bug that requires
-    // the scroll events to be batched to WHEEL_DELTA. Due to the their HID report
-    // descriptor, they don't actually support smooth scrolling. _Any_ scroll gets
-    // converted into a full WHEEL_DELTA scroll, even if the actual delta is tiny.
-    // Similarly, large scrolls are capped at +/- WHEEL_DELTA too so we'll need to
-    // split those up too.
-    {
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            return -1;
-        }
-
-        holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
-        {
-            holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
-        }
-        holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
-        holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
-        holder->packet.scroll.zero3 = 0;
-
-        err = offerInputPacket(holder);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-        }
-    }
-
-    return err;
-}
-
-// Send a scroll event to the streaming machine
-int LiSendScrollEvent(signed char scrollClicks) {
-    return LiSendHighResScrollEvent(scrollClicks * LI_WHEEL_DELTA);
-}
-
-// Send a high resolution horizontal scroll event
-int LiSendHighResHScrollEvent(short scrollAmount) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-
-
-    if (scrollAmount == 0) {
-        return 0;
-    }
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.hscroll.header.size = BE32(sizeof(SS_HSCROLL_PACKET) - sizeof(uint32_t));
-    holder->packet.hscroll.header.magic = LE32(SS_HSCROLL_MAGIC);
-    holder->packet.hscroll.scrollAmount = BE16(scrollAmount);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
-}
-
-int LiSendHScrollEvent(signed char scrollClicks) {
-    return LiSendHighResHScrollEvent(scrollClicks * LI_WHEEL_DELTA);
-}
-
-int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, float pressureOrDistance,
-                     float contactAreaMajor, float contactAreaMinor, uint16_t rotation) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-    if (!(SunshineFeatureFlags & LI_FF_PEN_TOUCH_EVENTS)) {
-        return LI_ERR_UNSUPPORTED;
-    }
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.touch.header.size = BE32(sizeof(SS_TOUCH_PACKET) - sizeof(uint32_t));
-    holder->packet.touch.header.magic = LE32(SS_TOUCH_MAGIC);
-    holder->packet.touch.eventType = eventType;
-    holder->packet.touch.pointerId = LE32(pointerId);
-    holder->packet.touch.rotation = LE16(rotation);
-    memset(holder->packet.touch.zero, 0, sizeof(holder->packet.touch.zero));
-    floatToNetfloat(x, holder->packet.touch.x);
-    floatToNetfloat(y, holder->packet.touch.y);
-    floatToNetfloat(pressureOrDistance, holder->packet.touch.pressureOrDistance);
-    floatToNetfloat(contactAreaMajor, holder->packet.touch.contactAreaMajor);
-    floatToNetfloat(contactAreaMinor, holder->packet.touch.contactAreaMinor);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
-}
+int LiSendHighResScrollEvent(short amount) { return sendScroll(PLANK_TRANSPORT_INPUT_VERTICAL_SCROLL, amount); }
+int LiSendHighResHScrollEvent(short amount) { return sendScroll(PLANK_TRANSPORT_INPUT_HORIZONTAL_SCROLL, amount); }
+int LiSendScrollEvent(signed char clicks) { return LiSendHighResScrollEvent(clicks * LI_WHEEL_DELTA); }
+int LiSendHScrollEvent(signed char clicks) { return LiSendHighResHScrollEvent(clicks * LI_WHEEL_DELTA); }
 
 int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
                    float x, float y, float pressureOrDistance,
                    float contactAreaMajor, float contactAreaMinor,
                    uint16_t rotation, uint8_t tilt) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-    if (!(SunshineFeatureFlags & LI_FF_PEN_TOUCH_EVENTS)) {
-        return LI_ERR_UNSUPPORTED;
-    }
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    currentPenButtonState = penButtons;
-
-    holder->packet.pen.header.size = BE32(sizeof(SS_PEN_PACKET) - sizeof(uint32_t));
-    holder->packet.pen.header.magic = LE32(SS_PEN_MAGIC);
-    holder->packet.pen.eventType = eventType;
-    holder->packet.pen.toolType = toolType;
-    holder->packet.pen.penButtons = penButtons;
-    memset(holder->packet.pen.zero, 0, sizeof(holder->packet.pen.zero));
-    floatToNetfloat(x, holder->packet.pen.x);
-    floatToNetfloat(y, holder->packet.pen.y);
-    floatToNetfloat(pressureOrDistance, holder->packet.pen.pressureOrDistance);
-    holder->packet.pen.rotation = LE16(rotation);
-    holder->packet.pen.tilt = tilt;
-    memset(holder->packet.pen.zero2, 0, sizeof(holder->packet.pen.zero2));
-    floatToNetfloat(contactAreaMajor, holder->packet.pen.contactAreaMajor);
-    floatToNetfloat(contactAreaMinor, holder->packet.pen.contactAreaMinor);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
-}
-
-int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepadMask, uint8_t type,
-                                 uint32_t supportedButtonFlags, uint16_t capabilities) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // Sunshine supports up to 16 controllers
-    controllerNumber %= MAX_GAMEPADS;
-
-    // Always set the older touchpad cap if we have dual touchpads
-    if (capabilities & LI_CCAP_DUAL_TOUCHPAD) {
-        capabilities |= LI_CCAP_TOUCHPAD;
-    }
-
-    // The arrival event is only supported by Sunshine
-    {
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            return -1;
-        }
-
-        holder->packet.controllerArrival.header.size = BE32(sizeof(SS_CONTROLLER_ARRIVAL_PACKET) - sizeof(uint32_t));
-        holder->packet.controllerArrival.header.magic = LE32(SS_CONTROLLER_ARRIVAL_MAGIC);
-        holder->packet.controllerArrival.controllerNumber = controllerNumber;
-        holder->packet.controllerArrival.type = type;
-        holder->packet.controllerArrival.capabilities = LE16(capabilities);
-        holder->packet.controllerArrival.supportedButtonFlags = LE32(supportedButtonFlags);
-
-        err = offerInputPacket(holder);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-            return err;
-        }
-    }
-
-    // Send a MC event just in case the host software doesn't support arrival events.
-    return LiSendMultiControllerEvent(controllerNumber, activeGamepadMask, 0, 0, 0, 0, 0, 0, 0);
-}
-
-int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uint8_t touchpadIndex, uint32_t pointerId, float x, float y, float pressure) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-    if (!(SunshineFeatureFlags & LI_FF_CONTROLLER_TOUCH_EVENTS)) {
-        return LI_ERR_UNSUPPORTED;
-    }
-
-    // Sunshine supports up to 16 controllers
-    controllerNumber %= MAX_GAMEPADS;
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.controllerTouch.header.size = BE32(sizeof(SS_CONTROLLER_TOUCH_PACKET) - sizeof(uint32_t));
-    holder->packet.controllerTouch.header.magic = LE32(SS_CONTROLLER_TOUCH_MAGIC);
-    holder->packet.controllerTouch.controllerNumber = controllerNumber;
-    holder->packet.controllerTouch.eventType = eventType;
-    memset(&holder->packet.controllerTouch.zero, 0, sizeof(holder->packet.controllerTouch.zero));
-    holder->packet.controllerTouch.touchpadIndex = touchpadIndex;
-    holder->packet.controllerTouch.pointerId = LE32(pointerId);
-    floatToNetfloat(x, holder->packet.controllerTouch.x);
-    floatToNetfloat(y, holder->packet.controllerTouch.y);
-    floatToNetfloat(pressure, holder->packet.controllerTouch.pressure);
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
-}
-
-int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType, uint32_t pointerId, float x, float y, float pressure) {
-    return LiSendControllerTouchEvent2(controllerNumber, eventType, 0, pointerId, x, y, pressure);
-}
-
-int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, float x, float y, float z) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // Check for valid motion type values
-    if (motionType - 1 >= MAX_MOTION_EVENTS) {
-        LC_ASSERT(motionType - 1 < MAX_MOTION_EVENTS);
-        return -3;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-    if (!(SunshineFeatureFlags & LI_FF_CONTROLLER_TOUCH_EVENTS)) {
-        return LI_ERR_UNSUPPORTED;
-    }
-
-    // Sunshine supports up to 16 controllers
-    controllerNumber %= MAX_GAMEPADS;
-
-    PltLockMutex(&batchedInputMutex);
-
-    currentGamepadSensorState[controllerNumber][motionType - 1].x = x;
-    currentGamepadSensorState[controllerNumber][motionType - 1].y = y;
-    currentGamepadSensorState[controllerNumber][motionType - 1].z = z;
-
-    // Queue a packet holder if this is the only pending sensor event
-    if (!currentGamepadSensorState[controllerNumber][motionType - 1].dirty) {
-        // Set the dirty flag to claim ownership of inserting the packet holder
-        // and unlock to allow other threads to enqueue or process input.
-        currentGamepadSensorState[controllerNumber][motionType - 1].dirty = true;
-        PltUnlockMutex(&batchedInputMutex);
-
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            currentGamepadSensorState[controllerNumber][motionType - 1].dirty = false;
-            return -1;
-        }
-
-        holder->packet.controllerMotion.header.size = BE32(sizeof(SS_CONTROLLER_MOTION_PACKET) - sizeof(uint32_t));
-        holder->packet.controllerMotion.header.magic = LE32(SS_CONTROLLER_MOTION_MAGIC);
-        holder->packet.controllerMotion.controllerNumber = controllerNumber;
-        holder->packet.controllerMotion.motionType = motionType;
-        memset(holder->packet.controllerMotion.zero, 0, sizeof(holder->packet.controllerMotion.zero));
-
-        // Remaining fields are set in the input thread based on the latest currentGamepadSensorState values
-
-        err = offerInputPacket(holder);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-
-            // We weren't able to insert the entry, so let the next call try again
-            currentGamepadSensorState[controllerNumber][motionType - 1].dirty = false;
-        }
-    }
-    else {
-        // There's already a packet holder queued to send this event
-        PltUnlockMutex(&batchedInputMutex);
-        err = 0;
-    }
-
-    return err;
-}
-
-int LiSendControllerBatteryEvent(uint8_t controllerNumber, uint8_t batteryState, uint8_t batteryPercentage) {
-    PPACKET_HOLDER holder;
-    int err;
-
-    if (!initialized) {
-        return -2;
-    }
-
-    // This is a protocol extension only supported with Sunshine
-
-
-    // Sunshine supports up to 16 controllers
-    controllerNumber %= MAX_GAMEPADS;
-
-    holder = allocatePacketHolder(0);
-    if (holder == NULL) {
-        return -1;
-    }
-
-    holder->packet.controllerBattery.header.size = BE32(sizeof(SS_CONTROLLER_BATTERY_PACKET) - sizeof(uint32_t));
-    holder->packet.controllerBattery.header.magic = LE32(SS_CONTROLLER_BATTERY_MAGIC);
-    holder->packet.controllerBattery.controllerNumber = controllerNumber;
-    holder->packet.controllerBattery.batteryState = batteryState;
-    holder->packet.controllerBattery.batteryPercentage = batteryPercentage;
-    memset(holder->packet.controllerBattery.zero, 0, sizeof(holder->packet.controllerBattery.zero));
-
-    err = offerInputPacket(holder);
-    if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
-        Limelog("Input queue reached maximum size limit\n");
-        freePacketHolder(holder);
-    }
-
-    return err;
+    if (!initialized) return -2;
+    if (!(SunshineFeatureFlags & LI_FF_PEN_TOUCH_EVENTS)) return LI_ERR_UNSUPPORTED;
+    PPACKET_HOLDER holder = allocatePacketHolder(PLANK_TRANSPORT_INPUT_PEN, PLANK_TRANSPORT_INPUT_PEN_SIZE);
+    if (!holder) return -1;
+    plank_transport_input_encode_pen(holder->payload, eventType, toolType, penButtons, tilt,
+        rotation, x, y, pressureOrDistance, contactAreaMajor, contactAreaMinor);
+    return offerInputPacket(holder);
 }

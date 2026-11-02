@@ -8,7 +8,6 @@ typedef struct _QUEUED_REFERENCE_FRAME_CONTROL {
 } QUEUED_REFERENCE_FRAME_CONTROL, *PQUEUED_REFERENCE_FRAME_CONTROL;
 
 typedef enum _PLANK_CALLBACK_TYPE {
-    SC_CALLBACK_HDR_MODE,
     SC_CALLBACK_RAW_HID_CONTROL,
     SC_CALLBACK_VIDEO_BITRATE_APPLIED,
     SC_CALLBACK_CURSOR_SHAPE,
@@ -25,7 +24,6 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint32_t appliedKbps;
             uint32_t peakKbps;
         } videoBitrateApplied;
-        bool hdrEnabled;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -47,8 +45,6 @@ static bool referenceFrameThreadStarted;
 // failure diagnostic. Zero means idle; low byte is type+1, upper bits are ms.
 static atomic_uint_fast64_t activeAsyncCallback;
 static uint32_t lastSeenFrame;
-static bool hdrEnabled;
-static SS_HDR_METADATA hdrMetadata;
 
 // A large 4K IDR can occupy the configured stream for several hundred
 // milliseconds. Keep retries far enough apart that they cannot overlap and
@@ -86,8 +82,6 @@ int initializeControlStream(void) {
     referenceFrameThreadStarted = false;
     atomic_store(&activeAsyncCallback, 0);
     lastSeenFrame = 0;
-    hdrEnabled = false;
-    memset(&hdrMetadata, 0, sizeof(hdrMetadata));
 
     PltCreateEvent(&idrFrameRequiredEvent);
     LbqInitializeLinkedBlockingQueue(&referenceFrameControlQueue, 20);
@@ -269,15 +263,6 @@ static void asyncCallbackThreadFunc(void* context) {
         atomic_store(&activeAsyncCallback,
                      (PltGetMillis() << 8) | (queuedCb->type + 1));
         switch (queuedCb->type) {
-        case SC_CALLBACK_HDR_MODE:
-            while (LbqPollQueueElementIf(&asyncCallbackQueue,
-                      (void**)&nextCb, callbackMatches, queuedCb) == LBQ_SUCCESS) {
-                LC_ASSERT(nextCb != queuedCb);
-                free(queuedCb);
-                queuedCb = nextCb;
-            }
-            ListenerCallbacks.setHdrMode(queuedCb->data.hdrEnabled);
-            break;
         case SC_CALLBACK_RAW_HID_CONTROL:
             if (ListenerCallbacks.rawHidControl != NULL) {
                 ListenerCallbacks.rawHidControl(queuedCb->variableData,
@@ -393,26 +378,12 @@ int stopControlStream(void) {
     return 0;
 }
 
-bool LiGetCurrentHostDisplayHdrMode(void) {
-    return hdrEnabled;
-}
-
-bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
-    if (!hdrEnabled) {
-        return false;
-    }
-
-    *metadata = hdrMetadata;
-    return true;
-}
-
 static bool isCursorPositionCallback(const void* data) {
     return ((const QUEUED_ASYNC_CALLBACK*)data)->type == SC_CALLBACK_CURSOR_POSITION;
 }
 
 static const char* callbackName(unsigned type) {
     switch (type) {
-    case SC_CALLBACK_HDR_MODE: return "hdr-mode";
     case SC_CALLBACK_RAW_HID_CONTROL: return "tablet-control";
     case SC_CALLBACK_VIDEO_BITRATE_APPLIED: return "bitrate-confirmation";
     case SC_CALLBACK_CURSOR_SHAPE: return "cursor-shape";
@@ -490,24 +461,6 @@ void LiNotifyPlankVideoBitrateApplied(uint32_t requestedKbps,
     queuedCb->data.videoBitrateApplied.requestedKbps = requestedKbps;
     queuedCb->data.videoBitrateApplied.appliedKbps = appliedKbps;
     queuedCb->data.videoBitrateApplied.peakKbps = peakKbps;
-    queueAsyncCallback(queuedCb);
-}
-
-void LiNotifyPlankHdrMode(bool enabled,
-                                   const SS_HDR_METADATA* metadata) {
-    PQUEUED_ASYNC_CALLBACK queuedCb;
-
-    if (!initialized || stopping || metadata == NULL) {
-        return;
-    }
-    hdrEnabled = enabled;
-    hdrMetadata = *metadata;
-    queuedCb = calloc(1, sizeof(*queuedCb));
-    if (queuedCb == NULL) {
-        return;
-    }
-    queuedCb->type = SC_CALLBACK_HDR_MODE;
-    queuedCb->data.hdrEnabled = enabled;
     queueAsyncCallback(queuedCb);
 }
 

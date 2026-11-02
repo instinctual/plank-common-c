@@ -259,10 +259,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&VideoCallbacks, drCallbacks, sizeof(VideoCallbacks));
     memcpy(&AudioCallbacks, arCallbacks, sizeof(AudioCallbacks));
 
-#ifdef LC_DEBUG_RECORD_MODE
-    // Install the pass-through recorder callbacks
-    setRecorderCallbacks(&VideoCallbacks, &AudioCallbacks);
-#endif
+
 
     // Hook the termination callback so we can avoid issuing a termination callback
     // after LiStopConnection() is called.
@@ -428,14 +425,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     ListenerCallbacks.stageComplete(STAGE_INPUT_STREAM_START);
     Limelog("done\n");
     
-    // Wiggle the mouse a bit to wake the display up
-    if (ActiveServiceFlags & PLANK_NATIVE_SERVICE_INPUT) {
-        LiSendMouseMoveEvent(1, 1);
-        PltSleepMs(10);
-        LiSendMouseMoveEvent(-1, -1);
-        PltSleepMs(10);
-    }
-
     ListenerCallbacks.connectionStarted();
 
 Cleanup:

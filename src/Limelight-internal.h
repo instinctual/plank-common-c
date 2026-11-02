@@ -4,7 +4,6 @@
 #include "Limelight.h"
 #include "PlatformThreads.h"
 #include "Video.h"
-#include "Input.h"
 
 // Common globals
 extern STREAM_CONFIGURATION StreamConfig;
@@ -56,7 +55,6 @@ void* extendBuffer(void* ptr, size_t newSize);
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
-void setRecorderCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks);
 
 int initializeControlStream(void);
 int startControlStream(void);
