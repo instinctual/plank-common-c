@@ -105,7 +105,18 @@ typedef struct _LENTRY {
 // For other codecs, any configuration data is not split into separate buffers.
 #define FRAME_TYPE_IDR    0x01
 
-// A decode unit describes a buffer chain of video data from multiple packets
+// Owned complete encoded frames. Data may be filled before submission only.
+// Submitted data is immutable until the last reference is released. The final
+// 64 bytes are zero padding required by bitstream readers, not stream payload.
+#define PLANK_VIDEO_BUFFER_PADDING 64
+#define PLANK_VIDEO_BUFFER_LIMIT (64 * 1024 * 1024)
+typedef struct _PLANK_VIDEO_BUFFER PLANK_VIDEO_BUFFER;
+PLANK_VIDEO_BUFFER* LiAllocateVideoBuffer(int capacity);
+unsigned char* LiVideoBufferData(PLANK_VIDEO_BUFFER* buffer);
+void LiRetainVideoBuffer(PLANK_VIDEO_BUFFER* buffer);
+void LiReleaseVideoBuffer(PLANK_VIDEO_BUFFER* buffer);
+
+// A decode unit describes views into one complete encoded frame.
 typedef struct _DECODE_UNIT {
     // Frame number
     int frameNumber;
@@ -145,6 +156,9 @@ typedef struct _DECODE_UNIT {
     // Head of the buffer chain (never NULL)
     PLENTRY bufferList;
 
+    // Owns all NAL views. Renderers may retain it past LiCompleteVideoFrame().
+    PLANK_VIDEO_BUFFER* frameBuffer;
+
     // Determines if this frame is SDR or HDR
     //
     // Note: This is not currently parsed from the actual bitstream, so if your
@@ -157,6 +171,10 @@ typedef struct _DECODE_UNIT {
     // client has access to a bitstream parser, prefer that over this field.
     uint8_t colorspace;
 } DECODE_UNIT, *PDECODE_UNIT;
+
+// Returns a padded, contiguous view when all retained NALs are adjacent and
+// extend to the end of the buffer. NULL means the caller must assemble them.
+const unsigned char* LiVideoFrameData(const DECODE_UNIT* unit);
 
 // Specifies that the audio stream should be encoded in stereo (default)
 #define AUDIO_CONFIGURATION_STEREO MAKE_AUDIO_CONFIGURATION(2, 0x3)
@@ -920,7 +938,8 @@ const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
 // depacketization. Returns 0 when queued, 1 when deliberately discarded while
 // waiting for a key frame, and a negative value for invalid input.
 #define PLANK_VIDEO_FRAME_FLAG_KEY 0x00000001u
-int LiSubmitPlankVideoFrame(const unsigned char* frame,
+// Borrows the caller reference and retains it only when queued. Submit once.
+int LiSubmitPlankVideoFrame(PLANK_VIDEO_BUFFER* buffer,
                                      int frameLength,
                                      uint32_t frameNumber,
                                      uint32_t flags,

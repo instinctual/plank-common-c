@@ -1,21 +1,60 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
-// Uncomment to test 3 byte Annex B start sequences with GFE
-//#define FORCE_3_BYTE_START_SEQUENCES
+// Parameter sets plus picture data: AVC has three views, HEVC four. AUD/SEI
+// prefixes are skipped. The picture view includes all subsequent slices.
+struct _PLANK_VIDEO_BUFFER {
+    atomic_uint references;
+    atomic_bool submitted;
+    int capacity, length, entryCount;
+    QUEUED_DECODE_UNIT queued;
+    LENTRY entries[4];
+    unsigned char data[];
+};
+static PLANK_VIDEO_BUFFER* assemblingBuffer;
+
+PLANK_VIDEO_BUFFER* LiAllocateVideoBuffer(int capacity) {
+    if (capacity <= 0 || capacity > PLANK_VIDEO_BUFFER_LIMIT) return NULL;
+    PLANK_VIDEO_BUFFER* buffer = malloc(sizeof(*buffer) + (size_t)capacity + PLANK_VIDEO_BUFFER_PADDING);
+    if (!buffer) return NULL;
+    atomic_init(&buffer->references, 1);
+    atomic_init(&buffer->submitted, false);
+    buffer->capacity = capacity;
+    buffer->length = buffer->entryCount = 0;
+    return buffer;
+}
+unsigned char* LiVideoBufferData(PLANK_VIDEO_BUFFER* buffer) { return buffer ? buffer->data : NULL; }
+void LiRetainVideoBuffer(PLANK_VIDEO_BUFFER* buffer) {
+    if (buffer) atomic_fetch_add_explicit(&buffer->references, 1, memory_order_relaxed);
+}
+void LiReleaseVideoBuffer(PLANK_VIDEO_BUFFER* buffer) {
+    if (buffer && atomic_fetch_sub_explicit(&buffer->references, 1, memory_order_acq_rel) == 1) free(buffer);
+}
+const unsigned char* LiVideoFrameData(const DECODE_UNIT* unit) {
+    if (!unit || !unit->frameBuffer || !unit->bufferList) return NULL;
+    const char* start = unit->bufferList->data;
+    const char* next = start;
+    for (PLENTRY entry = unit->bufferList; entry; entry = entry->next) {
+        if (entry->data != next) return NULL;
+        next += entry->length;
+    }
+    return next == (const char*)unit->frameBuffer->data + unit->frameBuffer->length &&
+        next - start == unit->fullLength ? (const unsigned char*)start : NULL;
+}
 
 static PLENTRY nalChainHead;
 static PLENTRY nalChainTail;
 static int nalChainDataLength;
 
 static unsigned int nextFrameNumber;
-static bool waitingForIdrFrame;
+static atomic_bool waitingForIdrFrame;
 static int frameType;
 static uint16_t frameHostProcessingLatency;
 static uint64_t frameReceiveTimeUs;
 static uint64_t framePresentationTimeUs;
 static uint32_t frameTimestamp90Khz;
-static bool dropStatePending;
-static bool idrFrameProcessed;
+static atomic_bool dropStatePending;
+static atomic_bool idrFrameProcessed;
 
 #define DR_CLEANUP -1000
 
@@ -29,11 +68,6 @@ typedef struct _BUFFER_DESC {
     unsigned int offset;
     unsigned int length;
 } BUFFER_DESC, *PBUFFER_DESC;
-
-typedef struct _LENTRY_INTERNAL {
-    LENTRY entry;
-    void* allocPtr;
-} LENTRY_INTERNAL, *PLENTRY_INTERNAL;
 
 #define H264_NAL_TYPE(x) ((x) & 0x1F)
 #define HEVC_NAL_TYPE(x) (((x) & 0x7E) >> 1)
@@ -66,17 +100,10 @@ void initializeVideoFrameAssembler(void) {
 
 // Free the NAL chain
 static void cleanupFrameState(void) {
-    PLENTRY_INTERNAL lastEntry;
-
-    while (nalChainHead != NULL) {
-        lastEntry = (PLENTRY_INTERNAL)nalChainHead;
-        nalChainHead = lastEntry->entry.next;
-        free(lastEntry->allocPtr);
-    }
-
-    nalChainTail = NULL;
-
+    nalChainHead = nalChainTail = NULL;
     nalChainDataLength = 0;
+    LiReleaseVideoBuffer(assemblingBuffer);
+    assemblingBuffer = NULL;
 }
 
 // Cleanup frame state and set that we're waiting for an IDR Frame
@@ -255,7 +282,6 @@ void LiWakeWaitForVideoFrame(void) {
 // Cleanup a decode unit by freeing the buffer chain and the holder
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
     PQUEUED_DECODE_UNIT qdu = handle;
-    PLENTRY_INTERNAL lastEntry;
 
     if (drStatus == DR_NEED_IDR) {
         Limelog("Requesting IDR frame on behalf of DR\n");
@@ -267,16 +293,9 @@ void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
         idrFrameProcessed = true;
     }
 
-    while (qdu->decodeUnit.bufferList != NULL) {
-        lastEntry = (PLENTRY_INTERNAL)qdu->decodeUnit.bufferList;
-        qdu->decodeUnit.bufferList = lastEntry->entry.next;
-        free(lastEntry->allocPtr);
-    }
-
-    // We will have stack-allocated entries iff we have a direct-submit decoder
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        free(qdu);
-    }
+    // The queue record and NAL views are embedded in this same buffer.
+    // A decoder may still hold a separate reference after this completion.
+    LiReleaseVideoBuffer(qdu->decodeUnit.frameBuffer);
 }
 
 static bool isSeqReferenceFrameStart(PBUFFER_DESC buffer) {
@@ -393,83 +412,71 @@ static void skipToNextNalOrEnd(PBUFFER_DESC buffer) {
 // Reassemble the frame with the given frame number
 static void reassembleFrame(int frameNumber) {
     if (nalChainHead != NULL) {
-        QUEUED_DECODE_UNIT qduDS;
-        PQUEUED_DECODE_UNIT qdu;
+        PQUEUED_DECODE_UNIT qdu = &assemblingBuffer->queued;
+        qdu->decodeUnit.frameBuffer = assemblingBuffer;
+        qdu->decodeUnit.bufferList = nalChainHead;
+        qdu->decodeUnit.fullLength = nalChainDataLength;
+        qdu->decodeUnit.frameType = frameType;
+        qdu->decodeUnit.frameNumber = frameNumber;
+        qdu->decodeUnit.frameHostProcessingLatency = frameHostProcessingLatency;
+        qdu->decodeUnit.receiveTimeUs = frameReceiveTimeUs;
+        qdu->decodeUnit.presentationTimeUs = framePresentationTimeUs;
+        qdu->decodeUnit.rtpTimestamp = frameTimestamp90Khz;
+        qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
 
-        // Use a stack allocation if we won't be queuing this
-        if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-            qdu = (PQUEUED_DECODE_UNIT)malloc(sizeof(*qdu));
+        // These might be wrong for a few frames during a transition between SDR and HDR,
+        // but the effects shouldn't very noticable since that's an infrequent operation.
+        //
+        // If we start sending this state in the frame header, we can make it 100% accurate.
+        qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
+        qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
+
+        // Invoke the key frame callback if needed
+        if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
+            qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
+            notifyKeyFrameReceived();
         }
         else {
-            qdu = &qduDS;
+            qdu->decodeUnit.frameType = FRAME_TYPE_PFRAME;
         }
 
-        if (qdu != NULL) {
-            qdu->decodeUnit.bufferList = nalChainHead;
-            qdu->decodeUnit.fullLength = nalChainDataLength;
-            qdu->decodeUnit.frameType = frameType;
-            qdu->decodeUnit.frameNumber = frameNumber;
-            qdu->decodeUnit.frameHostProcessingLatency = frameHostProcessingLatency;
-            qdu->decodeUnit.receiveTimeUs = frameReceiveTimeUs;
-            qdu->decodeUnit.presentationTimeUs = framePresentationTimeUs;
-            qdu->decodeUnit.rtpTimestamp = frameTimestamp90Khz;
-            qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
+        nalChainHead = nalChainTail = NULL;
+        nalChainDataLength = 0;
+        assemblingBuffer = NULL;
 
-            // These might be wrong for a few frames during a transition between SDR and HDR,
-            // but the effects shouldn't very noticable since that's an infrequent operation.
-            //
-            // If we start sending this state in the frame header, we can make it 100% accurate.
-            qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
-            qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
+        if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
+            if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) != LBQ_SUCCESS) {
+                Limelog("Video decode unit queue overflow\n");
 
-            // Invoke the key frame callback if needed
-            if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
-                qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
-                notifyKeyFrameReceived();
+                // RFI recovery is not supported here
+                waitingForIdrFrame = true;
+
+                // Clear NAL state for the frame that we failed to enqueue
+                assemblingBuffer = qdu->decodeUnit.frameBuffer;
+                nalChainHead = qdu->decodeUnit.bufferList;
+                nalChainDataLength = qdu->decodeUnit.fullLength;
+                dropFrameState();
+
+                // Free all frames in the decode unit queue
+                freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
+
+                // Request an IDR frame to recover
+                LiRequestIdrFrame();
+                return;
             }
-            else {
-                qdu->decodeUnit.frameType = FRAME_TYPE_PFRAME;
-            }
-
-            nalChainHead = nalChainTail = NULL;
-            nalChainDataLength = 0;
-
-            if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-                if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
-                    Limelog("Video decode unit queue overflow\n");
-
-                    // RFI recovery is not supported here
-                    waitingForIdrFrame = true;
-
-                    // Clear NAL state for the frame that we failed to enqueue
-                    nalChainHead = qdu->decodeUnit.bufferList;
-                    nalChainDataLength = qdu->decodeUnit.fullLength;
-                    dropFrameState();
-
-                    // Free the DU we were going to queue
-                    free(qdu);
-
-                    // Free all frames in the decode unit queue
-                    freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
-
-                    // Request an IDR frame to recover
-                    LiRequestIdrFrame();
-                    return;
-                }
-            }
-            else {
-                // Submit the frame to the decoder
-                validateDecodeUnitForPlayback(&qdu->decodeUnit);
-                LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
-            }
-
-            // Notify the control connection
-            connectionReceivedCompleteFrame(frameNumber, false);
-
-            // Clear frame drops
-            consecutiveFrameDrops = 0;
-
         }
+        else {
+            // Submit the frame to the decoder
+            validateDecodeUnitForPlayback(&qdu->decodeUnit);
+            LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
+        }
+
+        // Notify the control connection
+        connectionReceivedCompleteFrame(frameNumber, false);
+
+        // Clear frame drops
+        consecutiveFrameDrops = 0;
+
     }
 }
 
@@ -523,36 +530,22 @@ static int getBufferFlags(char* data, int length) {
     }
 }
 
-static void queueFragment(char* data, int offset, int length) {
-    PLENTRY_INTERNAL entry;
-
-    entry = (PLENTRY_INTERNAL)malloc(sizeof(*entry) + length);
-
-    if (entry != NULL) {
-        entry->entry.next = NULL;
-        entry->entry.length = length;
-        entry->allocPtr = entry;
-        entry->entry.data = (char*)(entry + 1);
-        memcpy(entry->entry.data, &data[offset], entry->entry.length);
-
-        entry->entry.bufferType = getBufferFlags(entry->entry.data, entry->entry.length);
-
-        nalChainDataLength += entry->entry.length;
-
-        if (nalChainTail == NULL) {
-            LC_ASSERT(nalChainHead == NULL);
-            nalChainHead = nalChainTail = (PLENTRY)entry;
-        }
-        else {
-            LC_ASSERT(nalChainHead != NULL);
-            nalChainTail->next = (PLENTRY)entry;
-            nalChainTail = nalChainTail->next;
-        }
-    }
+static bool queueFragment(char* data, int offset, int length) {
+    if (length <= 0 || assemblingBuffer->entryCount == 4) return false;
+    PLENTRY entry = &assemblingBuffer->entries[assemblingBuffer->entryCount++];
+    entry->next = NULL;
+    entry->length = length;
+    entry->data = &data[offset];
+    entry->bufferType = getBufferFlags(entry->data, length);
+    nalChainDataLength += length;
+    if (nalChainTail) nalChainTail->next = entry;
+    else nalChainHead = entry;
+    nalChainTail = entry;
+    return true;
 }
 
 // Split one complete native H.264/HEVC key frame into decoder buffer entries.
-static void processAvcHevcKeyFrame(PBUFFER_DESC currentPos) {
+static bool processAvcHevcKeyFrame(PBUFFER_DESC currentPos) {
     // We should not have any NALUs when processing a new key frame.
     LC_ASSERT(nalChainHead == NULL);
     LC_ASSERT(nalChainTail == NULL);
@@ -561,21 +554,17 @@ static void processAvcHevcKeyFrame(PBUFFER_DESC currentPos) {
         // Skip through any padding bytes
         if (!getAnnexBStartSequence(currentPos, NULL)) {
             skipToNextNalOrEnd(currentPos);
-            if (currentPos->length == 0) return;
+            if (currentPos->length == 0) return true;
         }
 
         // Skip prepended AUD or SEI NALUs and any padding between them.
         while (isAccessUnitDelimiter(currentPos) || isSeiNal(currentPos)) {
             skipToNextNalOrEnd(currentPos);
-            if (currentPos->length == 0) return;
+            if (currentPos->length == 0) return true;
         }
 
         int start = currentPos->offset;
         bool containsPicData = false;
-
-#ifdef FORCE_3_BYTE_START_SEQUENCES
-        start++;
-#endif
 
         if (isSeqReferenceFrameStart(currentPos)) {
             waitingForIdrFrame = false;
@@ -596,11 +585,12 @@ static void processAvcHevcKeyFrame(PBUFFER_DESC currentPos) {
             }
         }
 
-        queueFragment(currentPos->data, start, currentPos->offset - start);
+        if (!queueFragment(currentPos->data, start, currentPos->offset - start)) return false;
     }
+    return true;
 }
 
-int LiSubmitPlankVideoFrame(const unsigned char* frame,
+int LiSubmitPlankVideoFrame(PLANK_VIDEO_BUFFER* buffer,
                                      int frameLength,
                                      uint32_t frameNumber,
                                      uint32_t flags,
@@ -609,11 +599,16 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
     BUFFER_DESC currentPos;
     bool keyFrame;
 
-    if (frame == NULL || frameLength <= 0 ||
+    if (buffer == NULL || frameLength <= 0 || frameLength > buffer->capacity ||
             (flags & ~PLANK_VIDEO_FRAME_FLAG_KEY) != 0 ||
             !(NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265))) {
         return -1;
     }
+
+    if (atomic_exchange(&buffer->submitted, true)) return -1;
+    const unsigned char* frame = buffer->data;
+    buffer->length = frameLength;
+    memset(buffer->data + frameLength, 0, PLANK_VIDEO_BUFFER_PADDING);
 
     keyFrame = (flags & PLANK_VIDEO_FRAME_FLAG_KEY) != 0;
 
@@ -647,6 +642,8 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
     }
 
     cleanupFrameState();
+    LiRetainVideoBuffer(buffer);
+    assemblingBuffer = buffer;
     frameType = FRAME_TYPE_PFRAME;
     frameHostProcessingLatency = hostProcessingLatency;
     frameReceiveTimeUs = PltGetMicroseconds();
@@ -657,22 +654,22 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
     currentPos.offset = 0;
     currentPos.length = (unsigned int)frameLength;
     if (keyFrame) {
-        processAvcHevcKeyFrame(&currentPos);
+        const bool complete = processAvcHevcKeyFrame(&currentPos);
         PLENTRY entry = nalChainHead;
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {
             entry = entry && entry->bufferType == BUFFER_TYPE_VPS ? entry->next : NULL;
         }
         entry = entry && entry->bufferType == BUFFER_TYPE_SPS ? entry->next : NULL;
         entry = entry && entry->bufferType == BUFFER_TYPE_PPS ? entry->next : NULL;
-        if (!entry || entry->bufferType != BUFFER_TYPE_PICDATA || frameType != FRAME_TYPE_IDR) {
+        if (!complete || !entry || entry->next || entry->bufferType != BUFFER_TYPE_PICDATA || frameType != FRAME_TYPE_IDR) {
             cleanupFrameState();
             waitingForIdrFrame = true;
             return -1;
         }
     }
     else {
-        queueFragment(currentPos.data, 0, frameLength);
-        if (nalChainHead == NULL) {
+        if (!queueFragment(currentPos.data, 0, frameLength)) {
+            cleanupFrameState();
             waitingForIdrFrame = true;
             return -1;
         }
