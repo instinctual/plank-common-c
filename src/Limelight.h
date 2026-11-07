@@ -382,6 +382,9 @@ typedef void(*ConnListenerConnectionStarted)(void);
 // non-zero, it means the termination was probably unexpected (loss of network,
 // crash, or similar conditions). This will not be invoked as a result of a call
 // to LiStopConnection() or LiInterruptConnection().
+// Delivered once on a producer thread. Queue teardown on the owning session
+// thread; do not call LiStopConnection() synchronously from this callback.
+// LiStopConnection() joins the producers before the owner can release state.
 typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 
 // This error code is passed to ConnListenerConnectionTerminated() when the stream
@@ -646,30 +649,6 @@ uint64_t LiGetMillis(void);
 // Returns the number of queued video frames ready for delivery. Only relevant
 // if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
 int LiGetPendingVideoFrames(void);
-
-// Returns the number of queued audio frames ready for delivery. Only relevant
-// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer. For most uses,
-// LiGetPendingAudioDuration() is probably a better option than this function.
-int LiGetPendingAudioFrames(void);
-
-// Similar to LiGetPendingAudioFrames() except it returns the pending audio in
-// milliseconds rather than frames, which allows callers to be agnostic of the
-// negotiated audio frame duration.
-int LiGetPendingAudioDuration(void);
-
-// Returns a pointer to a struct containing various statistics about the RTP audio stream.
-// The data should be considered read-only and must not be modified.
-typedef struct _RTP_AUDIO_STATS {
-    uint32_t packetCountAudio;         // total audio packets
-    uint32_t packetCountFec;           // total packets of type FEC
-    uint32_t packetCountFecRecovered;  // a packet was saved
-    uint32_t packetCountFecFailed;     // tried to recover but too much was lost
-    uint32_t packetCountOOS;           // out-of-sequence packets
-    uint32_t packetCountInvalid;       // corrupted packets, etc
-    uint32_t packetCountFecInvalid;    // invalid FEC packet
-} RTP_AUDIO_STATS, *PRTP_AUDIO_STATS;
-
-const RTP_AUDIO_STATS* LiGetRTPAudioStats(void);
 
 // Returns a pointer to a struct containing various statistics about the RTP video stream.
 // The data should be considered read-only and must not be modified.

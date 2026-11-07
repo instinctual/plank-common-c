@@ -56,7 +56,6 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
 void PltInterruptThread(PLT_THREAD* thread);
 bool PltIsThreadInterrupted(PLT_THREAD* thread);
 void PltJoinThread(PLT_THREAD* thread);
-void PltDetachThread(PLT_THREAD* thread);
 
 int PltCreateEvent(PLT_EVENT* event);
 void PltCloseEvent(PLT_EVENT* event);

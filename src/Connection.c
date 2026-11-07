@@ -1,10 +1,9 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
 static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
-static bool alreadyTerminated;
-static PLT_THREAD terminationCallbackThread;
-static int terminationCallbackErrorCode;
+static atomic_bool alreadyTerminated = true;
 static bool NativeSessionConfigurationPending;
 static PLANK_NATIVE_SESSION_CONFIGURATION NativeSessionConfiguration;
 static uint32_t ActiveServiceFlags;
@@ -15,7 +14,6 @@ CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
-volatile bool ConnectionInterrupted;
 bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
 OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
@@ -104,7 +102,7 @@ int LiSetPlankNativeSessionConfiguration(
 // so it is not safe to start another connection before LiStartConnection() returns.
 void LiInterruptConnection(void) {
     // Signal anyone waiting on the global interrupted flag
-    ConnectionInterrupted = true;
+    atomic_store(&alreadyTerminated, true);
 }
 
 uint32_t LiGetPlankNativeServiceFlags(void) {
@@ -183,40 +181,15 @@ void LiStopConnection(void) {
 
 }
 
-static void terminationCallbackThreadFunc(void* context)
-{
-    // Invoke the client's termination callback
-    originalTerminationCallback(terminationCallbackErrorCode);
-}
-
-// This shim callback runs the client's connectionTerminated() callback on a
-// separate thread. This is neccessary because other internal threads directly
-// invoke this callback. That can result in a deadlock if the client
-// calls LiStopConnection() in the callback when the cleanup code
-// attempts to join the thread that the termination callback (and LiStopConnection)
-// is running on.
+// Notify on the producer thread. Owners enqueue recovery/teardown on their
+// session worker; they must not join media workers from this callback. All
+// producers are joined by LiStopConnection(), so callbacks cannot outlive the
+// session or leak into a replacement connection. No detached callback thread.
 static void ClInternalConnectionTerminated(int errorCode)
 {
-    int err;
-
-    // Avoid recursion and issuing multiple callbacks
-    if (alreadyTerminated || ConnectionInterrupted) {
-        return;
+    if (!atomic_exchange(&alreadyTerminated, true)) {
+        originalTerminationCallback(errorCode);
     }
-
-    terminationCallbackErrorCode = errorCode;
-    alreadyTerminated = true;
-
-    // Invoke the termination callback on a separate thread
-    err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
-    if (err != 0) {
-        // Nothing we can safely do here, so we'll just assert on debug builds
-        Limelog("Failed to create termination thread: %d\n", err);
-        LC_ASSERT(err == 0);
-    }
-
-    // Detach the thread since we never wait on it
-    PltDetachThread(&terminationCallbackThread);
 }
 
 // Starts the connection to the streaming machine
@@ -278,7 +251,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     Limelog("Native QUIC session negotiation is complete\n");
 
     alreadyTerminated = false;
-    ConnectionInterrupted = false;
     
     // Validate the audio configuration
     if ((ActiveServiceFlags & PLANK_NATIVE_SERVICE_AUDIO) &&

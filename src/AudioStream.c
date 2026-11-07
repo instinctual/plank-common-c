@@ -1,10 +1,8 @@
 #include "Limelight-internal.h"
 
-static RTP_AUDIO_STATS nativeAudioStats;
 static int64_t nextAudioPresentationTimeUs;
 
 int initializeAudioStream(void) {
-    memset(&nativeAudioStats, 0, sizeof(nativeAudioStats));
     nextAudioPresentationTimeUs = -1;
     return 0;
 }
@@ -77,16 +75,4 @@ int startAudioStream(void* audioContext, int arFlags) {
 
     AudioCallbacks.start();
     return 0;
-}
-
-int LiGetPendingAudioFrames(void) {
-    return 0;
-}
-
-int LiGetPendingAudioDuration(void) {
-    return 0;
-}
-
-const RTP_AUDIO_STATS* LiGetRTPAudioStats(void) {
-    return &nativeAudioStats;
 }
